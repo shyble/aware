@@ -1,0 +1,11 @@
+{
+  "n_stories": 10000,
+  "n_train_stories": 9500,
+  "n_val_stories": 500,
+  "train_bytes": 8292178,
+  "val_bytes": 420347,
+  "estimated_train_tokens": 2073044,
+  "estimated_val_tokens": 105086,
+  "seed": 42,
+  "val_ratio": 0.05
+}

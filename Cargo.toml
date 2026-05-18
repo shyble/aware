@@ -1,0 +1,47 @@
+[package]
+name = "aware"
+version = "0.1.0"
+edition = "2021"
+description = "AWARE: Identifiable computational units for AI"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+
+# Candle (CPU/CUDA/Metal tensors). Opt-in via features.
+candle-core = { version = "0.10", optional = true }
+candle-nn = { version = "0.10", optional = true }
+
+[features]
+default = ["candle"]
+# CPU candle backend (default)
+candle = ["candle-core", "candle-nn"]
+# CUDA backend (Linux/Windows): cargo build --features cuda
+cuda = ["candle", "candle-core/cuda"]
+# Apple Metal backend (Apple Silicon): cargo build --features metal
+metal = ["candle", "candle-core/metal"]
+
+[lib]
+name = "aware"
+path = "src/lib.rs"
+
+[[example]]
+name = "run_benchmark"
+path = "examples/run_benchmark.rs"
+required-features = ["candle"]
+
+[[example]]
+name = "train_with_concepts"
+path = "examples/train_with_concepts.rs"
+required-features = ["candle"]
+
+[[example]]
+name = "cap_native_run_benchmark"
+path = "examples/cap_native_run_benchmark.rs"
+required-features = ["candle"]
+
+[profile.release]
+lto = true
+codegen-units = 1
