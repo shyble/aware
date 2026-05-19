@@ -550,8 +550,8 @@ The complete implementation is available in the AWARE codebase
 (URL: `https://github.com/shyble/aware`).
 
 **Implementation language**: AWARE is implemented in **Rust**, using the
-[candle](https://github.com/huggingface/candle) tensor library for
-forward/backward computation on CPU and GPU (CUDA, Apple Metal). This
+candle tensor library (Hugging Face 2023) for forward/backward
+computation on CPU and GPU (CUDA, Apple Metal). This
 choice diverges from the prevailing Python/PyTorch convention in ML
 research. The motivation is straightforward: Rust's ownership model
 enforces tensor lifetime correctness at compile time, eliminating an
@@ -1054,6 +1054,8 @@ settings is the central open question for follow-up work.
   arXiv:2412.08905.
 - DeepSeek-AI, et al. (2025). DeepSeek-R1: Incentivizing Reasoning
   Capability in LLMs via Reinforcement Learning. arXiv:2501.12948.
+- Hugging Face (2023). candle: Minimalist ML framework for Rust.
+  https://github.com/huggingface/candle
 
 ---
 
