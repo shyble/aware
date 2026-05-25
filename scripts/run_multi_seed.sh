@@ -102,6 +102,28 @@ case "$CONFIG_ID" in
               AWARE_BENCH_CAP_DISCOVERY=kmeans AWARE_BENCH_CAP_WINDOW=3)
         ;;
 
+    # ── Param-matched vanilla transformer baselines ──
+    # Paper #2 §7.3 explicitly notes the parameter-scale gap between
+    # cap-native (143-368M) and paper #1's pure_transformer (853K). These
+    # presets train standard transformers at matched parameter counts to
+    # isolate architectural contribution from raw capacity. Standard
+    # transformer body params ≈ 12 × n_blocks × d_model² (d_ff = 4 × d_model).
+
+    # ~150M params — matches cap_native_hier_d128 (143M).
+    # 12 × 16 × 896² = 154M.
+    pure_transformer_match_hier)
+        ARGS=(AWARE_BENCH_D_MODEL=896 AWARE_BENCH_N_BLOCKS=16
+              AWARE_BENCH_N_HEADS=8 AWARE_BENCH_D_FF=3584
+              AWARE_BENCH_ATTENTION=standard AWARE_BENCH_INCLUDE_CAP_LAYER=false)
+        ;;
+    # ~300M params — matches cap_native_sparse_d128 (368M) within ~20%.
+    # 12 × 24 × 1024² = 302M.  (GPT-2-medium dimensions.)
+    pure_transformer_match_single)
+        ARGS=(AWARE_BENCH_D_MODEL=1024 AWARE_BENCH_N_BLOCKS=24
+              AWARE_BENCH_N_HEADS=16 AWARE_BENCH_D_FF=4096
+              AWARE_BENCH_ATTENTION=standard AWARE_BENCH_INCLUDE_CAP_LAYER=false)
+        ;;
+
     # ── Cap-native architecture configs ──
     # All use the cap_native_run_benchmark example (different EXAMPLE binary).
     cap_native_full)
@@ -209,6 +231,131 @@ case "$CONFIG_ID" in
         EXAMPLE="./target/release/examples/cap_native_run_benchmark"
         ARGS=(AWARE_BENCH_D_MODEL=128 AWARE_BENCH_N_BLOCKS=4 AWARE_BENCH_D_FF=512
               AWARE_BENCH_CAP_N_TARGET=330 AWARE_BENCH_CAP_WINDOW=3
+              AWARE_BENCH_CAP_DISCOVERY=kmeans
+              AWARE_CN_TOP_K=1 AWARE_CN_ROUTING=sparse
+              AWARE_CN_HIERARCHICAL=true
+              AWARE_CN_L1_N_CAPS=128 AWARE_CN_L1_WINDOW=1
+              AWARE_CN_L1_DISCOVERY=kmeans)
+        ;;
+
+    # ── Phase G sub-ablations: hierarchical sub-knobs ──
+    # n_caps_1 sweep: hold W_1=1, vary layer-1 cap count.
+    cap_native_hier_d128_n64)
+        EXAMPLE="./target/release/examples/cap_native_run_benchmark"
+        ARGS=(AWARE_BENCH_D_MODEL=128 AWARE_BENCH_N_BLOCKS=4 AWARE_BENCH_D_FF=512
+              AWARE_BENCH_CAP_N_TARGET=330 AWARE_BENCH_CAP_WINDOW=3
+              AWARE_BENCH_CAP_DISCOVERY=kmeans
+              AWARE_CN_TOP_K=1 AWARE_CN_ROUTING=sparse
+              AWARE_CN_HIERARCHICAL=true
+              AWARE_CN_L1_N_CAPS=64 AWARE_CN_L1_WINDOW=1
+              AWARE_CN_L1_DISCOVERY=kmeans)
+        ;;
+    cap_native_hier_d128_n256)
+        EXAMPLE="./target/release/examples/cap_native_run_benchmark"
+        ARGS=(AWARE_BENCH_D_MODEL=128 AWARE_BENCH_N_BLOCKS=4 AWARE_BENCH_D_FF=512
+              AWARE_BENCH_CAP_N_TARGET=330 AWARE_BENCH_CAP_WINDOW=3
+              AWARE_BENCH_CAP_DISCOVERY=kmeans
+              AWARE_CN_TOP_K=1 AWARE_CN_ROUTING=sparse
+              AWARE_CN_HIERARCHICAL=true
+              AWARE_CN_L1_N_CAPS=256 AWARE_CN_L1_WINDOW=1
+              AWARE_CN_L1_DISCOVERY=kmeans)
+        ;;
+    cap_native_hier_d128_n330)
+        EXAMPLE="./target/release/examples/cap_native_run_benchmark"
+        ARGS=(AWARE_BENCH_D_MODEL=128 AWARE_BENCH_N_BLOCKS=4 AWARE_BENCH_D_FF=512
+              AWARE_BENCH_CAP_N_TARGET=330 AWARE_BENCH_CAP_WINDOW=3
+              AWARE_BENCH_CAP_DISCOVERY=kmeans
+              AWARE_CN_TOP_K=1 AWARE_CN_ROUTING=sparse
+              AWARE_CN_HIERARCHICAL=true
+              AWARE_CN_L1_N_CAPS=330 AWARE_CN_L1_WINDOW=1
+              AWARE_CN_L1_DISCOVERY=kmeans)
+        ;;
+
+    # W_1 sweep: hold n_caps_1=128, vary layer-1 window.
+    cap_native_hier_d128_w2)
+        EXAMPLE="./target/release/examples/cap_native_run_benchmark"
+        ARGS=(AWARE_BENCH_D_MODEL=128 AWARE_BENCH_N_BLOCKS=4 AWARE_BENCH_D_FF=512
+              AWARE_BENCH_CAP_N_TARGET=330 AWARE_BENCH_CAP_WINDOW=3
+              AWARE_BENCH_CAP_DISCOVERY=kmeans
+              AWARE_CN_TOP_K=1 AWARE_CN_ROUTING=sparse
+              AWARE_CN_HIERARCHICAL=true
+              AWARE_CN_L1_N_CAPS=128 AWARE_CN_L1_WINDOW=2
+              AWARE_CN_L1_DISCOVERY=kmeans)
+        ;;
+    cap_native_hier_d128_w3)
+        EXAMPLE="./target/release/examples/cap_native_run_benchmark"
+        ARGS=(AWARE_BENCH_D_MODEL=128 AWARE_BENCH_N_BLOCKS=4 AWARE_BENCH_D_FF=512
+              AWARE_BENCH_CAP_N_TARGET=330 AWARE_BENCH_CAP_WINDOW=3
+              AWARE_BENCH_CAP_DISCOVERY=kmeans
+              AWARE_CN_TOP_K=1 AWARE_CN_ROUTING=sparse
+              AWARE_CN_HIERARCHICAL=true
+              AWARE_CN_L1_N_CAPS=128 AWARE_CN_L1_WINDOW=3
+              AWARE_CN_L1_DISCOVERY=kmeans)
+        ;;
+
+    # Phase D for hierarchical: KMeans++ on layer 0 (the new discovery
+    # strategy we added). Layer 1 stays at KMeans.
+    cap_native_hier_d128_kmeanspp)
+        EXAMPLE="./target/release/examples/cap_native_run_benchmark"
+        ARGS=(AWARE_BENCH_D_MODEL=128 AWARE_BENCH_N_BLOCKS=4 AWARE_BENCH_D_FF=512
+              AWARE_BENCH_CAP_N_TARGET=330 AWARE_BENCH_CAP_WINDOW=3
+              AWARE_BENCH_CAP_DISCOVERY=kmeans_pp
+              AWARE_CN_TOP_K=1 AWARE_CN_ROUTING=sparse
+              AWARE_CN_HIERARCHICAL=true
+              AWARE_CN_L1_N_CAPS=128 AWARE_CN_L1_WINDOW=1
+              AWARE_CN_L1_DISCOVERY=kmeans_pp)
+        ;;
+
+    # Phase F: cap-indexed attention mask ablation on hierarchical winner.
+    cap_native_hier_d128_indexed)
+        EXAMPLE="./target/release/examples/cap_native_run_benchmark"
+        ARGS=(AWARE_BENCH_D_MODEL=128 AWARE_BENCH_N_BLOCKS=4 AWARE_BENCH_D_FF=512
+              AWARE_BENCH_CAP_N_TARGET=330 AWARE_BENCH_CAP_WINDOW=3
+              AWARE_BENCH_CAP_DISCOVERY=kmeans
+              AWARE_CN_TOP_K=1 AWARE_CN_ROUTING=sparse
+              AWARE_CN_CAP_INDEXED_MASK=true
+              AWARE_CN_HIERARCHICAL=true
+              AWARE_CN_L1_N_CAPS=128 AWARE_CN_L1_WINDOW=1
+              AWARE_CN_L1_DISCOVERY=kmeans)
+        ;;
+
+    # Phase B: top-K routing on hierarchical winner.
+    cap_native_hier_d128_top4)
+        EXAMPLE="./target/release/examples/cap_native_run_benchmark"
+        ARGS=(AWARE_BENCH_D_MODEL=128 AWARE_BENCH_N_BLOCKS=4 AWARE_BENCH_D_FF=512
+              AWARE_BENCH_CAP_N_TARGET=330 AWARE_BENCH_CAP_WINDOW=3
+              AWARE_BENCH_CAP_DISCOVERY=kmeans
+              AWARE_CN_TOP_K=4 AWARE_CN_ROUTING=soft
+              AWARE_CN_HIERARCHICAL=true
+              AWARE_CN_L1_N_CAPS=128 AWARE_CN_L1_WINDOW=1
+              AWARE_CN_L1_DISCOVERY=kmeans)
+        ;;
+    cap_native_hier_d128_top8)
+        EXAMPLE="./target/release/examples/cap_native_run_benchmark"
+        ARGS=(AWARE_BENCH_D_MODEL=128 AWARE_BENCH_N_BLOCKS=4 AWARE_BENCH_D_FF=512
+              AWARE_BENCH_CAP_N_TARGET=330 AWARE_BENCH_CAP_WINDOW=3
+              AWARE_BENCH_CAP_DISCOVERY=kmeans
+              AWARE_CN_TOP_K=8 AWARE_CN_ROUTING=soft
+              AWARE_CN_HIERARCHICAL=true
+              AWARE_CN_L1_N_CAPS=128 AWARE_CN_L1_WINDOW=1
+              AWARE_CN_L1_DISCOVERY=kmeans)
+        ;;
+
+    # Phase C: cap_window sweep on hierarchical winner (varies layer-0 W).
+    cap_native_hier_d128_cw1)
+        EXAMPLE="./target/release/examples/cap_native_run_benchmark"
+        ARGS=(AWARE_BENCH_D_MODEL=128 AWARE_BENCH_N_BLOCKS=4 AWARE_BENCH_D_FF=512
+              AWARE_BENCH_CAP_N_TARGET=330 AWARE_BENCH_CAP_WINDOW=1
+              AWARE_BENCH_CAP_DISCOVERY=kmeans
+              AWARE_CN_TOP_K=1 AWARE_CN_ROUTING=sparse
+              AWARE_CN_HIERARCHICAL=true
+              AWARE_CN_L1_N_CAPS=128 AWARE_CN_L1_WINDOW=1
+              AWARE_CN_L1_DISCOVERY=kmeans)
+        ;;
+    cap_native_hier_d128_cw5)
+        EXAMPLE="./target/release/examples/cap_native_run_benchmark"
+        ARGS=(AWARE_BENCH_D_MODEL=128 AWARE_BENCH_N_BLOCKS=4 AWARE_BENCH_D_FF=512
+              AWARE_BENCH_CAP_N_TARGET=330 AWARE_BENCH_CAP_WINDOW=5
               AWARE_BENCH_CAP_DISCOVERY=kmeans
               AWARE_CN_TOP_K=1 AWARE_CN_ROUTING=sparse
               AWARE_CN_HIERARCHICAL=true

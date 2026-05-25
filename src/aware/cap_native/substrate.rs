@@ -279,15 +279,13 @@ impl CapNativeBuilder {
         // activations, then builds layer 1 CapLayer with h_0 as its
         // KMeans sample. Downstream cap-keyed components are sized to
         // n_caps_1 and routed by cap_acts_1.
+        //
+        // For W_1 > 1 (Phase G), we additionally window h_0 to width W_1
+        // before passing to KMeans — analogous to layer 0's windowing of
+        // token embeddings, but operating in d_model space over
+        // contextualised representations.
         let cap_layer_1: Option<CapLayer> = if cfg.hierarchical {
             let l1_window = cfg.cap_layer_1.cap_window.max(1);
-            if l1_window != 1 {
-                return Err(candle_core::Error::Msg(
-                    "hierarchical cap-native: only cap_layer_1.cap_window=1 supported \
-                     currently; W_1>1 is Phase G work"
-                        .into(),
-                ));
-            }
             // Build h_0 samples by forwarding layer 0 on the bootstrap
             // tokens. Use the same token list that drove layer 0's
             // discovery (the user-supplied bootstrap_sample_tokens).
@@ -300,7 +298,28 @@ impl CapNativeBuilder {
                         .to_dtype(DType::U32)?;
                     let emb_3d = embeddings.forward(&tok_tensor)?; // (1, n_total, d_model)
                     let h0 = cap_layer.forward(&emb_3d)?; // (1, n_total, d_model)
-                    Some(h0.reshape((n_total, cfg.d_model))?)
+                    if l1_window == 1 {
+                        // Flat per-position sample for W_1 = 1.
+                        Some(h0.reshape((n_total, cfg.d_model))?)
+                    } else {
+                        // Causal windowing of h_0 to width W_1: pad left
+                        // with W_1 - 1 zero positions, then concat W_1
+                        // shifted slices along the feature dim. Output
+                        // shape: (n_total, W_1 * d_model).
+                        let pad = Tensor::zeros(
+                            (1, l1_window - 1, cfg.d_model),
+                            h0.dtype(),
+                            &device,
+                        )?;
+                        let padded = Tensor::cat(&[&pad, &h0], 1)?; // (1, n_total+W_1-1, d_model)
+                        let mut pieces: Vec<Tensor> = Vec::with_capacity(l1_window);
+                        for off in 0..l1_window {
+                            pieces.push(padded.narrow(1, off, n_total)?);
+                        }
+                        let refs: Vec<&Tensor> = pieces.iter().collect();
+                        let windowed = Tensor::cat(&refs, candle_core::D::Minus1)?; // (1, n_total, W_1 * d_model)
+                        Some(windowed.reshape((n_total, l1_window * cfg.d_model))?)
+                    }
                 }
             } else {
                 None
@@ -483,6 +502,39 @@ mod tests {
             .with_bootstrap_sample_tokens(bootstrap)
             .build()
             .unwrap();
+        let tokens = Tensor::from_vec(vec![0u32, 1, 2, 3], (1, 4), &cpu()).unwrap();
+        let logits = model.forward(&tokens).unwrap();
+        assert_eq!(logits.dims(), &[1, 4, 32]);
+    }
+
+    #[test]
+    fn build_and_forward_hierarchical_w1_2() {
+        // Phase G prep: W_1=2 windowing over h_0. Layer 1 sees 2-position
+        // windows of the contextualised representations from layer 0.
+        let mut cfg = tiny_config();
+        cfg.cap_config.discovery = DiscoveryKind::KMeans;
+        cfg.cap_config.cap_window = 2;
+        cfg.cap_config.n_caps_target = 8;
+        cfg.hierarchical = true;
+        cfg.cap_layer_1.n_caps_target = 4;
+        cfg.cap_layer_1.cap_window = 2; // W_1 > 1
+        cfg.cap_layer_1.discovery = DiscoveryKind::KMeans;
+
+        let bootstrap = (0u32..16).collect::<Vec<_>>();
+        let model = CapNativeSubstrate::builder()
+            .with_config(cfg)
+            .with_device(cpu())
+            .with_bootstrap_sample_tokens(bootstrap)
+            .build()
+            .unwrap();
+
+        assert!(model.cap_layer_1.is_some());
+        // Layer 1 should be set up with cap_window=2; its d_in_per_window
+        // is d_model * W_1 = 16 * 2 = 32.
+        let layer1 = model.cap_layer_1.as_ref().unwrap();
+        assert_eq!(layer1.d_in_per_window, 32);
+        assert_eq!(layer1.config.cap_window, 2);
+
         let tokens = Tensor::from_vec(vec![0u32, 1, 2, 3], (1, 4), &cpu()).unwrap();
         let logits = model.forward(&tokens).unwrap();
         assert_eq!(logits.dims(), &[1, 4, 32]);
