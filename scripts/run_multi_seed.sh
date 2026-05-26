@@ -90,6 +90,18 @@ case "$CONFIG_ID" in
               AWARE_BENCH_INCLUDE_CAP_LAYER=false)
         ;;
 
+    # ── d=64 baselines (matched to cap-native d=64 ablations) ──
+    pure_transformer_d64)
+        ARGS=(AWARE_BENCH_D_MODEL=64 AWARE_BENCH_N_BLOCKS=4 AWARE_BENCH_D_FF=256
+              AWARE_BENCH_ATTENTION=standard AWARE_BENCH_INCLUDE_CAP_LAYER=false)
+        ;;
+    kmeans_w3_d64)
+        ARGS=(AWARE_BENCH_D_MODEL=64 AWARE_BENCH_N_BLOCKS=4 AWARE_BENCH_D_FF=256
+              AWARE_BENCH_CAP_N_TARGET=64
+              AWARE_BENCH_ATTENTION=standard AWARE_BENCH_INCLUDE_CAP_LAYER=true
+              AWARE_BENCH_CAP_DISCOVERY=kmeans AWARE_BENCH_CAP_WINDOW=3)
+        ;;
+
     # ── Cap-native architecture configs ──
     # All use the cap_native_run_benchmark example (different EXAMPLE binary).
     cap_native_full)
@@ -150,13 +162,23 @@ case "$CONFIG_ID" in
               AWARE_BENCH_CAP_DISCOVERY=kmeans
               AWARE_CN_TOP_K=0 AWARE_CN_ROUTING=soft)
         ;;
-    # Option B fallback: smaller config (blocks=2, n_caps=32) for tighter compute
+    # Smallest cap-native preset (blocks=2, n_caps=32, soft routing) for smoke testing.
+    # Soft routing here is intentionally expensive; use *_sparse_* variant for low memory.
     cap_native_full_d64_small)
         EXAMPLE="./target/release/examples/cap_native_run_benchmark"
         ARGS=(AWARE_BENCH_D_MODEL=64 AWARE_BENCH_N_BLOCKS=2 AWARE_BENCH_D_FF=256
               AWARE_BENCH_CAP_N_TARGET=32 AWARE_BENCH_CAP_WINDOW=4
               AWARE_BENCH_CAP_DISCOVERY=kmeans
               AWARE_CN_TOP_K=0 AWARE_CN_ROUTING=soft)
+        ;;
+    # Sparse-routing counterpart for low-memory smoke tests (HardTop1; only the
+    # winning cap's stack is computed per token).
+    cap_native_sparse_d64_small)
+        EXAMPLE="./target/release/examples/cap_native_run_benchmark"
+        ARGS=(AWARE_BENCH_D_MODEL=64 AWARE_BENCH_N_BLOCKS=2 AWARE_BENCH_D_FF=256
+              AWARE_BENCH_CAP_N_TARGET=32 AWARE_BENCH_CAP_WINDOW=4
+              AWARE_BENCH_CAP_DISCOVERY=kmeans
+              AWARE_CN_TOP_K=1 AWARE_CN_ROUTING=sparse)
         ;;
 
     # ── Stage-2 d=128 sparse presets (cap-native headline runs) ──
@@ -166,6 +188,32 @@ case "$CONFIG_ID" in
               AWARE_BENCH_CAP_N_TARGET=330 AWARE_BENCH_CAP_WINDOW=3
               AWARE_BENCH_CAP_DISCOVERY=kmeans
               AWARE_CN_TOP_K=1 AWARE_CN_ROUTING=sparse)
+        ;;
+    # Memory-tractable variant: paper #1 block structure (d=128, n_blocks=4)
+    # but n_caps reduced from 330 to 64 — per-cap weight stacks at every
+    # block force ~5.6 GB floor at n_caps=330. n_caps=64 brings model
+    # ~80 M params (~1.4 GB floor + ~3-4 GB peak).
+    cap_native_sparse_d128_n64)
+        EXAMPLE="./target/release/examples/cap_native_run_benchmark"
+        ARGS=(AWARE_BENCH_D_MODEL=128 AWARE_BENCH_N_BLOCKS=4 AWARE_BENCH_D_FF=512
+              AWARE_BENCH_CAP_N_TARGET=64 AWARE_BENCH_CAP_WINDOW=3
+              AWARE_BENCH_CAP_DISCOVERY=kmeans
+              AWARE_CN_TOP_K=1 AWARE_CN_ROUTING=sparse)
+        ;;
+    # Phase E: hierarchical variant. Layer 0 over token windows (W_0=3,
+    # n_caps=330 matched to paper #1); layer 1 discovered over h_0
+    # (W_1=1, n_caps_1=128). Downstream cap-keyed components sized to
+    # n_caps_1 — much smaller than single-discovery at n=330. Expected
+    # ~150M params, ~6-7 GB peak.
+    cap_native_hier_d128)
+        EXAMPLE="./target/release/examples/cap_native_run_benchmark"
+        ARGS=(AWARE_BENCH_D_MODEL=128 AWARE_BENCH_N_BLOCKS=4 AWARE_BENCH_D_FF=512
+              AWARE_BENCH_CAP_N_TARGET=330 AWARE_BENCH_CAP_WINDOW=3
+              AWARE_BENCH_CAP_DISCOVERY=kmeans
+              AWARE_CN_TOP_K=1 AWARE_CN_ROUTING=sparse
+              AWARE_CN_HIERARCHICAL=true
+              AWARE_CN_L1_N_CAPS=128 AWARE_CN_L1_WINDOW=1
+              AWARE_CN_L1_DISCOVERY=kmeans)
         ;;
     *)
         echo "Unknown config: $CONFIG_ID"
@@ -178,9 +226,14 @@ esac
 # Build the right example binary (default run_benchmark, or cap_native_run_benchmark
 # if a cap_native_* config overrode EXAMPLE above).
 EXAMPLE_NAME=$(basename "$EXAMPLE")
+# AWARE_FEATURES selects the candle backend at build time: candle (CPU,
+# default), metal, or cuda. The example binary is shared across
+# backends, so the active feature flag determines which device the
+# runtime will see. Match this with AWARE_DEVICE at runtime.
+AWARE_FEATURES="${AWARE_FEATURES:-candle}"
 if [ ! -x "$EXAMPLE" ]; then
-    echo "[bench] building $EXAMPLE_NAME…"
-    cargo build --release --features candle --example "$EXAMPLE_NAME"
+    echo "[bench] building $EXAMPLE_NAME (features=$AWARE_FEATURES)…"
+    cargo build --release --features "$AWARE_FEATURES" --example "$EXAMPLE_NAME"
 fi
 
 echo "[multi-seed] config=$CONFIG_ID  seeds=${SEEDS[*]}  steps=$STEPS"

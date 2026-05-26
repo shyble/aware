@@ -38,6 +38,9 @@
 
 use std::env;
 use std::fs;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
 use std::time::Instant;
 
 use aware::aware::attention::CapMatrixSource;
@@ -45,8 +48,36 @@ use aware::aware::{
     AttentionKind, BlockBuilder, CapConfig, DiscoveryKind, LossKind, OptimizerKind,
     StreamingFeeder, Substrate,
 };
-use aware::data::bpe::load_bpe;
-use aware::data::bpe::BPETokenizer;
+use aware::data::bpe::{ensure_tokenized, load_bpe, BPETokenizer};
+
+/// Sample a bootstrap set from a tokenized .bin file without loading the
+/// whole corpus into memory.
+fn sample_bootstrap_from_file(
+    path: &Path,
+    n_samples: usize,
+    window: usize,
+    seed: u64,
+) -> std::io::Result<Vec<u32>> {
+    let mut file = File::open(path)?;
+    let n_tokens = (file.metadata()?.len() as usize) / 4;
+    let max_start = n_tokens.saturating_sub(window.max(1) + 1).max(1);
+    let mut rng = if seed == 0 { 0xC0FFEE_BABE } else { seed };
+    let mut out = Vec::with_capacity(n_samples * window.max(1));
+    let chunk_bytes = window.max(1) * 4;
+    let mut buf = vec![0u8; chunk_bytes];
+    for _ in 0..n_samples {
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let start = ((rng >> 33) as usize) % max_start;
+        file.seek(SeekFrom::Start((start * 4) as u64))?;
+        file.read_exact(&mut buf)?;
+        for chunk in buf.chunks_exact(4) {
+            out.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+    }
+    Ok(out)
+}
 use candle_core::{Device, Result};
 use candle_nn::Optimizer;
 
@@ -95,6 +126,7 @@ fn parse_attention(s: &str) -> AttentionKind {
 fn parse_discovery(s: &str) -> DiscoveryKind {
     match s {
         "kmeans" => DiscoveryKind::KMeans,
+        "kmeans_pp" | "kmeanspp" | "kmeans++" => DiscoveryKind::KMeansPP,
         "random" => DiscoveryKind::Random,
         "hybrid" => DiscoveryKind::Hybrid,
         _ => DiscoveryKind::NoDiscovery,
@@ -187,94 +219,75 @@ fn main() -> Result<()> {
     println!("  steps:           {}  (eval every {})", steps, eval_every);
     println!();
 
-    // ── Load train corpus + BPE ──
-    let read_t = Instant::now();
-    let corpus = fs::read_to_string(&corpus_path).unwrap_or_else(|e| {
-        eprintln!("ERROR: read {}: {}", corpus_path, e);
-        std::process::exit(1)
-    });
-
+    // ── Load BPE (train from a brief corpus pass if missing) ──
     let bpe = match load_bpe("data/brain_tinystories") {
         Ok(b) => b,
-        Err(_) => BPETokenizer::train(&corpus, 256),
+        Err(_) => {
+            let sample = fs::read_to_string(&corpus_path).unwrap_or_else(|e| {
+                eprintln!("ERROR: read {}: {}", corpus_path, e);
+                std::process::exit(1)
+            });
+            let trained = BPETokenizer::train(&sample, 256);
+            drop(sample);
+            trained
+        }
     };
-    let train_all: Vec<u32> = bpe.encode(&corpus).into_iter().map(|t| t as u32).collect();
-    drop(corpus);
-    println!(
-        "[bench] tokenize train: {} tokens in {:.1}s",
-        train_all.len(),
-        read_t.elapsed().as_secs_f64()
-    );
 
-    // ── Val split: from separate file if AWARE_BENCH_VAL_CORPUS set,
-    //              otherwise slice from train (deprecated path) ──
-    let (train_tokens, val_tokens) = if let Some(vp) = &val_corpus_path {
-        let vt = Instant::now();
-        let val_corpus = fs::read_to_string(vp).unwrap_or_else(|e| {
-            eprintln!("ERROR: read val {}: {}", vp, e);
+    // ── Tokenize once and cache as .bin (disk-streamed for training) ──
+    let read_t = Instant::now();
+    let train_bin = ensure_tokenized(Path::new(&corpus_path), &bpe).unwrap_or_else(|e| {
+        eprintln!("ERROR: tokenize train: {}", e);
+        std::process::exit(1)
+    });
+    let val_bin = match val_corpus_path.as_ref() {
+        Some(vp) => ensure_tokenized(Path::new(vp), &bpe).unwrap_or_else(|e| {
+            eprintln!("ERROR: tokenize val: {}", e);
             std::process::exit(1)
-        });
-        let val_toks: Vec<u32> = bpe
-            .encode(&val_corpus)
-            .into_iter()
-            .map(|t| t as u32)
-            .collect();
-        println!(
-            "[bench] tokenize val:   {} tokens in {:.1}s (from {})",
-            val_toks.len(),
-            vt.elapsed().as_secs_f64(),
-            vp
-        );
-        (train_all, val_toks)
-    } else {
-        let split = (train_all.len() as f64 * (1.0 - val_ratio)) as usize;
-        let mut all = train_all;
-        let val_toks = all.split_off(split);
-        eprintln!("[bench] WARNING: val sliced from train tail (size {}); set AWARE_BENCH_VAL_CORPUS for proper held-out val", val_toks.len());
-        (all, val_toks)
+        }),
+        None => {
+            eprintln!(
+                "ERROR: AWARE_BENCH_VAL_CORPUS required for disk-streaming mode \
+                 (val_ratio={}; pass an explicit val file)",
+                val_ratio
+            );
+            std::process::exit(1)
+        }
     };
+
+    let n_train_tokens = (fs::metadata(&train_bin).unwrap().len() / 4) as usize;
+    let n_val_tokens = (fs::metadata(&val_bin).unwrap().len() / 4) as usize;
     println!(
-        "[bench] split: train={} val={}",
-        train_tokens.len(),
-        val_tokens.len()
+        "[bench] tokenized in {:.1}s: train={} val={}",
+        read_t.elapsed().as_secs_f64(),
+        n_train_tokens,
+        n_val_tokens
     );
 
     // ── Compute effective epochs ──
     let total_train_tokens = (steps * tokens_per_step) as f64;
-    let effective_epochs = total_train_tokens / train_tokens.len() as f64;
-    println!("[bench] will train on {} tokens over {} steps = {:.2} effective epochs over the {} train corpus",
-        total_train_tokens as usize, steps, effective_epochs, train_tokens.len());
+    let effective_epochs = total_train_tokens / n_train_tokens as f64;
+    println!(
+        "[bench] will train on {} tokens over {} steps = {:.2} effective epochs over the {} train corpus",
+        total_train_tokens as usize, steps, effective_epochs, n_train_tokens
+    );
 
     // ── Bootstrap sample for KMeans discovery ──
-    // Target ~2000 sample vectors. When cap_window > 1, sample consecutive
-    // token windows (so the bootstrap sample matches the cap layer's d_in).
-    let target_samples = 2000usize;
-    let mut bs_rng = seed;
-    let bootstrap_tokens: Vec<u32> = if cap_window > 1 {
-        let n_windows = target_samples;
-        let max_start = train_tokens.len().saturating_sub(cap_window + 1);
-        let mut toks = Vec::with_capacity(n_windows * cap_window);
-        for _ in 0..n_windows {
-            bs_rng = bs_rng
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            let start = ((bs_rng >> 33) as usize) % max_start.max(1);
-            toks.extend_from_slice(&train_tokens[start..start + cap_window]);
-        }
-        toks
-    } else {
-        (0..target_samples.min(train_tokens.len()))
-            .map(|_| {
-                bs_rng = bs_rng
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                train_tokens[((bs_rng >> 33) as usize) % train_tokens.len()]
-            })
-            .collect()
-    };
+    // Target ~2000 sample vectors, drawn directly from train.bin without
+    // loading the corpus into memory.
+    let bootstrap_tokens = sample_bootstrap_from_file(
+        &train_bin,
+        2000,
+        cap_window.max(1),
+        seed,
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("ERROR: bootstrap sample: {}", e);
+        std::process::exit(1)
+    });
 
     // ── Build substrate ──
-    let device = Device::Cpu;
+    let device = aware::aware::default_device()?;
+    println!("  device:          {}", aware::aware::device_label(&device));
     let mut builder = Substrate::builder()
         .with_vocab(bpe.vocab_size())
         .with_d_model(d_model)
@@ -332,8 +345,17 @@ fn main() -> Result<()> {
 
     // ── Feeders (seeded) ──
     let mut train_feeder =
-        StreamingFeeder::from_tokens(train_tokens, batch_size, seq_len).with_seed(seed);
-    let mut val_feeder = StreamingFeeder::from_tokens(val_tokens, batch_size, seq_len)
+        StreamingFeeder::from_file(&train_bin, batch_size, seq_len)
+            .unwrap_or_else(|e| {
+                eprintln!("ERROR: open train feeder: {}", e);
+                std::process::exit(1)
+            })
+            .with_seed(seed);
+    let mut val_feeder = StreamingFeeder::from_file(&val_bin, batch_size, seq_len)
+        .unwrap_or_else(|e| {
+            eprintln!("ERROR: open val feeder: {}", e);
+            std::process::exit(1)
+        })
         .with_seed(seed.wrapping_add(1));
 
     // ── Optimizer ──

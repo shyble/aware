@@ -1,5 +1,31 @@
 use super::super::config::CapConfig;
+use super::super::discover::DiscoveryKind;
 use super::compression::{CompressionConfig, RoutingMode};
+
+/// Layer 1 cap config for the hierarchical variant. Layer 1's caps are
+/// discovered over the d_model-dimensional output of layer 0 (h_0)
+/// rather than over token embeddings, so its scale differs from the
+/// input cap layer.
+#[derive(Debug, Clone)]
+pub struct CapLayer1Config {
+    pub n_caps_target: usize,
+    pub n_caps_budget: usize,
+    pub cap_window: usize,
+    pub discovery: DiscoveryKind,
+    pub gradient_train: bool,
+}
+
+impl Default for CapLayer1Config {
+    fn default() -> Self {
+        Self {
+            n_caps_target: 128,
+            n_caps_budget: 512,
+            cap_window: 1,
+            discovery: DiscoveryKind::KMeans,
+            gradient_train: false,
+        }
+    }
+}
 
 // Note: CapConfig doesn't impl Serialize/Deserialize, so neither does this.
 // Bench runner constructs CapNativeConfig from env vars at runtime; no
@@ -31,6 +57,12 @@ pub struct CapNativeConfig {
 
     /// Optimization (dtype, compression).
     pub compression: CompressionConfig,
+
+    /// Path Y / Phase E: two-layer cap discovery. When `hierarchical`
+    /// is true, the cap-keyed blocks downstream are sized to and
+    /// routed by `cap_layer_1` (the layer-1 caps discovered over h_0).
+    pub hierarchical: bool,
+    pub cap_layer_1: CapLayer1Config,
 }
 
 impl Default for CapNativeConfig {
@@ -55,11 +87,23 @@ impl Default for CapNativeConfig {
             cap_indexed_mask: false,
             routing: RoutingMode::SoftTopK,
             compression: CompressionConfig::default(),
+            hierarchical: false,
+            cap_layer_1: CapLayer1Config::default(),
         }
     }
 }
 
 impl CapNativeConfig {
+    /// Number of caps that drives the cap-keyed components downstream.
+    /// In single-discovery mode this is layer 0's n_caps; in
+    /// hierarchical mode it's layer 1's n_caps.
+    pub fn downstream_n_caps(&self) -> usize {
+        if self.hierarchical {
+            self.cap_layer_1.n_caps_target
+        } else {
+            self.cap_config.n_caps_target
+        }
+    }
     pub fn n_caps(&self) -> usize {
         self.cap_config.n_caps_target
     }
@@ -71,11 +115,22 @@ impl CapNativeConfig {
     }
 
     pub fn label(&self) -> String {
-        format!(
- "cap_native(d={},blocks={},heads={},dff={}, n_caps={},top_k={},window={},disc={:?},c4c={})",
- self.d_model, self.n_blocks, self.n_heads, self.d_ff,
- self.n_caps(), self.top_k, self.cap_window(),
- self.cap_config.discovery, self.cap_indexed_mask,
- )
+        if self.hierarchical {
+            format!(
+                "cap_native_hier(d={},blocks={},heads={},dff={}, n_caps_0={},n_caps_1={},top_k={},w_0={},w_1={},disc_0={:?},disc_1={:?},c4c={})",
+                self.d_model, self.n_blocks, self.n_heads, self.d_ff,
+                self.n_caps(), self.cap_layer_1.n_caps_target, self.top_k,
+                self.cap_window(), self.cap_layer_1.cap_window.max(1),
+                self.cap_config.discovery, self.cap_layer_1.discovery,
+                self.cap_indexed_mask,
+            )
+        } else {
+            format!(
+                "cap_native(d={},blocks={},heads={},dff={}, n_caps={},top_k={},window={},disc={:?},c4c={})",
+                self.d_model, self.n_blocks, self.n_heads, self.d_ff,
+                self.n_caps(), self.top_k, self.cap_window(),
+                self.cap_config.discovery, self.cap_indexed_mask,
+            )
+        }
     }
 }

@@ -335,3 +335,35 @@ pub fn load_bpe(dir: &str) -> std::io::Result<BPETokenizer> {
     bincode::deserialize(&bpe_bytes)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
+
+/// Tokenize a text corpus once and cache the result as a raw u32
+/// little-endian binary file next to the source text. Subsequent calls
+/// short-circuit if the cache is fresh (mtime >= source). Pair with
+/// `StreamingFeeder::from_file` for constant-memory training.
+///
+/// Returns the path to the cached `.bin` file.
+pub fn ensure_tokenized(
+    text_path: &std::path::Path,
+    bpe: &BPETokenizer,
+) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write;
+
+    let tokens_path = text_path.with_extension("bin");
+    if tokens_path.exists() {
+        let text_mtime = std::fs::metadata(text_path)?.modified()?;
+        let cache_mtime = std::fs::metadata(&tokens_path)?.modified()?;
+        if cache_mtime >= text_mtime {
+            return Ok(tokens_path);
+        }
+    }
+    let text = std::fs::read_to_string(text_path)?;
+    let tokens: Vec<u32> = bpe.encode(&text).into_iter().map(|t| t as u32).collect();
+    let mut buf = Vec::with_capacity(tokens.len() * 4);
+    for &t in &tokens {
+        buf.extend_from_slice(&t.to_le_bytes());
+    }
+    let mut file = std::fs::File::create(&tokens_path)?;
+    file.write_all(&buf)?;
+    file.sync_all()?;
+    Ok(tokens_path)
+}

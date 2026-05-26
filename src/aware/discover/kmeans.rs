@@ -11,6 +11,10 @@ pub struct KMeansDiscovery {
     pub max_iters: usize,
     pub seed: u64,
     pub hybrid: bool,
+    /// When true, use k-means++ seeding (D²-weighted sampling) instead
+    /// of uniform random row sampling. Reduces seed-to-seed variance
+    /// from KMeans bootstrap.
+    pub kmeans_pp_init: bool,
 }
 
 impl Default for KMeansDiscovery {
@@ -19,6 +23,7 @@ impl Default for KMeansDiscovery {
             max_iters: 25,
             seed: 42,
             hybrid: false,
+            kmeans_pp_init: false,
         }
     }
 }
@@ -27,6 +32,13 @@ impl KMeansDiscovery {
     pub fn hybrid() -> Self {
         Self {
             hybrid: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn kmeans_pp() -> Self {
+        Self {
+            kmeans_pp_init: true,
             ..Self::default()
         }
     }
@@ -44,7 +56,13 @@ impl Discovery for KMeansDiscovery {
         // If a sample is provided, run k-means. Otherwise fall back to random
         // unit-vector init (caller is expected to bootstrap from data later).
         let keys = if let Some(sample) = ctx.sample {
-            kmeans(sample, ctx.n_caps_target, self.max_iters, self.seed)?
+            kmeans(
+                sample,
+                ctx.n_caps_target,
+                self.max_iters,
+                self.seed,
+                self.kmeans_pp_init,
+            )?
         } else {
             // No sample -> random unit vectors as a stand-in. Caller can
             // re-bootstrap once data is available.
@@ -73,18 +91,30 @@ impl Discovery for KMeansDiscovery {
 
 /// Mini-batch-ish k-means on a [n_samples, d] tensor. Returns centroids
 /// of shape [k, d], normalized to unit length.
-fn kmeans(sample: &Tensor, k: usize, max_iters: usize, seed: u64) -> Result<Tensor> {
+fn kmeans(
+    sample: &Tensor,
+    k: usize,
+    max_iters: usize,
+    seed: u64,
+    use_pp_init: bool,
+) -> Result<Tensor> {
     let (n_samples, d) = sample.dims2()?;
     let device = sample.device().clone();
+    let _ = d; // d unused at outer scope; kept for compatibility with update_centroids signature
 
-    // Initialize centroids by picking k random sample rows.
-    let mut rng = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-    let mut indices: Vec<usize> = Vec::with_capacity(k);
-    for _ in 0..k {
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-        indices.push((rng >> 33) as usize % n_samples.max(1));
-    }
-    // Gather: pick rows by index.
+    // Initialize centroids.
+    let indices = if use_pp_init {
+        kmeans_pp_indices(sample, k, seed)?
+    } else {
+        // Uniform random row sampling (original behavior).
+        let mut rng = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let mut indices: Vec<usize> = Vec::with_capacity(k);
+        for _ in 0..k {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            indices.push((rng >> 33) as usize % n_samples.max(1));
+        }
+        indices
+    };
     let mut centroids = gather_rows(sample, &indices)?; // [k, d]
 
     for _iter in 0..max_iters {
@@ -123,6 +153,77 @@ fn kmeans(sample: &Tensor, k: usize, max_iters: usize, seed: u64) -> Result<Tens
         .sqrt()?
         .clamp(1e-8f32, f32::INFINITY)?;
     centroids.broadcast_div(&norm)
+}
+
+/// k-means++ seeding (Arthur & Vassilvitskii, 2007). Picks the first
+/// centroid uniformly at random, then each subsequent centroid with
+/// probability proportional to D(x)² where D(x) is the distance from
+/// x to its nearest already-chosen centroid. Vastly more stable across
+/// seeds than uniform random sampling.
+fn kmeans_pp_indices(sample: &Tensor, k: usize, seed: u64) -> Result<Vec<usize>> {
+    let n_samples = sample.dim(0)?;
+    if n_samples == 0 || k == 0 {
+        return Ok(Vec::new());
+    }
+    let sample_data = sample.to_vec2::<f32>()?; // CPU-side for the seeding pass
+    let d = if sample_data.is_empty() { 0 } else { sample_data[0].len() };
+
+    let mut rng = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+    let mut next_random = || {
+        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (rng >> 33) as f64 / ((1u64 << 31) as f64)
+    };
+
+    let mut indices: Vec<usize> = Vec::with_capacity(k);
+    // Pick the first centroid uniformly at random.
+    let first = (next_random() * n_samples as f64) as usize;
+    indices.push(first.min(n_samples - 1));
+
+    // Track squared distance from each sample to its nearest existing centroid.
+    let mut dists_sq: Vec<f32> = vec![f32::INFINITY; n_samples];
+    for i in 0..n_samples {
+        let mut s = 0f32;
+        for j in 0..d {
+            let diff = sample_data[i][j] - sample_data[indices[0]][j];
+            s += diff * diff;
+        }
+        dists_sq[i] = s;
+    }
+
+    // Pick the remaining k-1 centroids weighted by D(x)².
+    for _ in 1..k {
+        let total: f32 = dists_sq.iter().sum();
+        if total <= 0.0 {
+            // All remaining points coincide with chosen centroids; pick uniformly.
+            let pick = (next_random() * n_samples as f64) as usize;
+            indices.push(pick.min(n_samples - 1));
+            continue;
+        }
+        let target = (next_random() as f32) * total;
+        let mut cum = 0f32;
+        let mut chosen = n_samples - 1;
+        for i in 0..n_samples {
+            cum += dists_sq[i];
+            if cum >= target {
+                chosen = i;
+                break;
+            }
+        }
+        indices.push(chosen);
+        // Update distances: each sample's nearest now might be the new centroid.
+        for i in 0..n_samples {
+            let mut s = 0f32;
+            for j in 0..d {
+                let diff = sample_data[i][j] - sample_data[chosen][j];
+                s += diff * diff;
+            }
+            if s < dists_sq[i] {
+                dists_sq[i] = s;
+            }
+        }
+    }
+
+    Ok(indices)
 }
 
 fn gather_rows(sample: &Tensor, indices: &[usize]) -> Result<Tensor> {

@@ -18,6 +18,11 @@ pub struct CapNativeSubstrate {
     pub embeddings: Embedding,
     /// Layer 0: CapLayer (discovered CapMatrix + windowed firing + projection).
     pub cap_layer: CapLayer,
+    /// Layer 1: optional second CapLayer for hierarchical mode (Phase E).
+    /// Discovered over h_0 activations rather than token embeddings.
+    /// When present, downstream cap-keyed components route by its
+    /// activations (sized to `cap_layer_1.n_caps`).
+    pub cap_layer_1: Option<CapLayer>,
     pub blocks: Vec<CapNativeBlock>,
     pub final_norm: CapKeyedRmsNorm,
     pub output: CapKeyedOutput,
@@ -34,9 +39,23 @@ impl CapNativeSubstrate {
         // Layer 0: discovered cap layer produces both the d_model input signal
         // and the cap_acts routing signal.
         let h0 = self.cap_layer.forward(&emb)?; // (B, S, d_model)
-        let cap_acts = self.cap_layer.cap_activations(&emb)?; // (B, S, n_caps)
 
-        let mut h = h0;
+        // In hierarchical mode the routing signal and the downstream
+        // input come from layer 1 (discovered over h_0). In single-
+        // discovery mode they come from layer 0.
+        let (h, cap_acts) = match &self.cap_layer_1 {
+            Some(layer1) => {
+                let h1 = layer1.forward(&h0)?; // (B, S, d_model)
+                let cap_acts_1 = layer1.cap_activations(&h0)?; // (B, S, n_caps_1)
+                (h1, cap_acts_1)
+            }
+            None => {
+                let cap_acts_0 = self.cap_layer.cap_activations(&emb)?; // (B, S, n_caps_0)
+                (h0, cap_acts_0)
+            }
+        };
+
+        let mut h = h;
         for block in &self.blocks {
             h = block.forward(&h, &cap_acts)?;
         }
@@ -70,7 +89,7 @@ impl CapNativeSubstrate {
             .map(|v| v.elem_count())
             .sum();
         // CapLayer's CapMatrix keys are frozen (not in varmap when discovered).
-        let frozen: usize = self.cap_layer.caps.keys.elem_count()
+        let mut frozen: usize = self.cap_layer.caps.keys.elem_count()
             + self
                 .cap_layer
                 .caps
@@ -78,6 +97,15 @@ impl CapNativeSubstrate {
                 .as_ref()
                 .map(|v| v.elem_count())
                 .unwrap_or(0);
+        if let Some(layer1) = &self.cap_layer_1 {
+            frozen += layer1.caps.keys.elem_count()
+                + layer1
+                    .caps
+                    .values
+                    .as_ref()
+                    .map(|v| v.elem_count())
+                    .unwrap_or(0);
+        }
         trainable + frozen
     }
 }
@@ -165,6 +193,22 @@ impl CapNativeBuilder {
         self
     }
 
+    /// Enable hierarchical mode (Phase E): second discovered CapLayer
+    /// over h_0 drives the downstream cap-keyed components.
+    pub fn with_hierarchical(mut self, enabled: bool) -> Self {
+        self.config.hierarchical = enabled;
+        self
+    }
+
+    /// Configure layer 1 (hierarchical mode only).
+    pub fn with_cap_layer_1_config(
+        mut self,
+        cap_layer_1: super::config::CapLayer1Config,
+    ) -> Self {
+        self.config.cap_layer_1 = cap_layer_1;
+        self
+    }
+
     /// Provide tokens for cap discovery bootstrap (KMeans uses this).
     pub fn with_bootstrap_sample_tokens(mut self, tokens: Vec<u32>) -> Self {
         self.bootstrap_sample_tokens = Some(tokens);
@@ -217,17 +261,76 @@ impl CapNativeBuilder {
         };
 
         // Build CapLayer with the same VarMap so its w_proj is trainable.
-        let vb = VarBuilder::from_varmap(&varmap.lock().unwrap(), dtype, &device);
-        let cap_layer = CapLayer::new(
-            cfg.cap_config.clone(),
-            cfg.d_model, // d_emb == d_model in this setup
-            cfg.d_model,
-            &device,
-            bootstrap_sample.as_ref(),
-            vb.pp("cap_layer"),
-        )?;
+        let cap_layer = {
+            let vm_guard = varmap.lock().unwrap();
+            let vb = VarBuilder::from_varmap(&vm_guard, dtype, &device);
+            CapLayer::new(
+                cfg.cap_config.clone(),
+                cfg.d_model, // d_emb == d_model in this setup
+                cfg.d_model,
+                &device,
+                bootstrap_sample.as_ref(),
+                vb.pp("cap_layer"),
+            )?
+        };
+
+        // Hierarchical: discover layer 1 over h_0 samples.
+        // Phase E: forwards layer 0 on the bootstrap tokens to get h_0
+        // activations, then builds layer 1 CapLayer with h_0 as its
+        // KMeans sample. Downstream cap-keyed components are sized to
+        // n_caps_1 and routed by cap_acts_1.
+        let cap_layer_1: Option<CapLayer> = if cfg.hierarchical {
+            let l1_window = cfg.cap_layer_1.cap_window.max(1);
+            if l1_window != 1 {
+                return Err(candle_core::Error::Msg(
+                    "hierarchical cap-native: only cap_layer_1.cap_window=1 supported \
+                     currently; W_1>1 is Phase G work"
+                        .into(),
+                ));
+            }
+            // Build h_0 samples by forwarding layer 0 on the bootstrap
+            // tokens. Use the same token list that drove layer 0's
+            // discovery (the user-supplied bootstrap_sample_tokens).
+            let h0_sample: Option<Tensor> = if let Some(toks) = &self.bootstrap_sample_tokens {
+                let n_total = toks.len();
+                if n_total == 0 {
+                    None
+                } else {
+                    let tok_tensor = Tensor::from_vec(toks.clone(), (1, n_total), &device)?
+                        .to_dtype(DType::U32)?;
+                    let emb_3d = embeddings.forward(&tok_tensor)?; // (1, n_total, d_model)
+                    let h0 = cap_layer.forward(&emb_3d)?; // (1, n_total, d_model)
+                    Some(h0.reshape((n_total, cfg.d_model))?)
+                }
+            } else {
+                None
+            };
+
+            let mut l1_cap_config = super::super::config::CapConfig::default();
+            l1_cap_config.n_caps_target = cfg.cap_layer_1.n_caps_target;
+            l1_cap_config.n_caps_budget = cfg.cap_layer_1.n_caps_budget;
+            l1_cap_config.gradient_train = cfg.cap_layer_1.gradient_train;
+            l1_cap_config.cap_window = l1_window;
+            l1_cap_config.discovery = cfg.cap_layer_1.discovery;
+
+            let vm_guard = varmap.lock().unwrap();
+            let vb = VarBuilder::from_varmap(&vm_guard, dtype, &device);
+            Some(CapLayer::new(
+                l1_cap_config,
+                cfg.d_model, // d_emb = d_model — layer 1's input is h_0
+                cfg.d_model,
+                &device,
+                h0_sample.as_ref(),
+                vb.pp("cap_layer_1"),
+            )?)
+        } else {
+            None
+        };
 
         // Cap-native blocks (all cap-keyed, no input projection - h0 comes from cap_layer.forward).
+        // Hierarchical: downstream blocks sized to n_caps_1 so they
+        // consume cap_acts_1 from layer 1.
+        let downstream_n_caps = cfg.downstream_n_caps();
         let block_cfg = CapNativeBlockConfig {
             d_model: cfg.d_model,
             n_heads: cfg.n_heads,
@@ -235,7 +338,7 @@ impl CapNativeBuilder {
             max_seq_len: cfg.max_seq_len,
             rope_base: cfg.rope_base,
             rms_eps: cfg.rms_eps,
-            n_caps: cfg.n_caps(),
+            n_caps: downstream_n_caps,
             top_k: cfg.top_k,
             cap_indexed_mask: cfg.cap_indexed_mask,
             routing: cfg.routing,
@@ -254,7 +357,7 @@ impl CapNativeBuilder {
 
         // Final cap-keyed norm.
         let final_norm = CapKeyedRmsNorm::new(
-            cfg.n_caps(),
+            downstream_n_caps,
             cfg.d_model,
             cfg.top_k,
             cfg.rms_eps,
@@ -266,7 +369,7 @@ impl CapNativeBuilder {
 
         // Cap-keyed output projection.
         let output = CapKeyedOutput::new(
-            cfg.n_caps(),
+            downstream_n_caps,
             cfg.d_model,
             cfg.vocab,
             cfg.top_k,
@@ -284,6 +387,7 @@ impl CapNativeBuilder {
             dtype,
             embeddings,
             cap_layer,
+            cap_layer_1,
             blocks,
             final_norm,
             output,
@@ -323,6 +427,8 @@ mod tests {
             cap_indexed_mask: false,
             routing: RoutingMode::SoftTopK,
             compression: Default::default(),
+            hierarchical: false,
+            cap_layer_1: Default::default(),
         }
     }
 
@@ -377,6 +483,42 @@ mod tests {
             .with_bootstrap_sample_tokens(bootstrap)
             .build()
             .unwrap();
+        let tokens = Tensor::from_vec(vec![0u32, 1, 2, 3], (1, 4), &cpu()).unwrap();
+        let logits = model.forward(&tokens).unwrap();
+        assert_eq!(logits.dims(), &[1, 4, 32]);
+    }
+
+    #[test]
+    fn build_and_forward_hierarchical() {
+        // Phase E: two-layer cap discovery. Layer 0 fires over token
+        // windows, layer 1 fires over the layer-0 output (h_0). All
+        // downstream cap-keyed components are sized to n_caps_1.
+        let mut cfg = tiny_config();
+        cfg.cap_config.discovery = DiscoveryKind::KMeans;
+        cfg.cap_config.cap_window = 2;
+        cfg.cap_config.n_caps_target = 8;
+        cfg.hierarchical = true;
+        cfg.cap_layer_1.n_caps_target = 4; // smaller than layer 0
+        cfg.cap_layer_1.cap_window = 1;
+        cfg.cap_layer_1.discovery = DiscoveryKind::KMeans;
+
+        let bootstrap = (0u32..16).collect::<Vec<_>>();
+        let model = CapNativeSubstrate::builder()
+            .with_config(cfg)
+            .with_device(cpu())
+            .with_bootstrap_sample_tokens(bootstrap)
+            .build()
+            .unwrap();
+
+        // Layer 1 must be present.
+        assert!(model.cap_layer_1.is_some());
+        // Downstream blocks/norm/output sized to layer-1 n_caps.
+        for block in &model.blocks {
+            assert_eq!(block.attn.n_caps, 4);
+        }
+        assert_eq!(model.final_norm.n_caps, 4);
+        assert_eq!(model.output.n_caps, 4);
+
         let tokens = Tensor::from_vec(vec![0u32, 1, 2, 3], (1, 4), &cpu()).unwrap();
         let logits = model.forward(&tokens).unwrap();
         assert_eq!(logits.dims(), &[1, 4, 32]);
