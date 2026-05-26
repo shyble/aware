@@ -915,9 +915,9 @@ has clear limitations:
    primitive but not exercised during training. Whether live audit
    during training improves quality on diverse corpora is untested.
 
-5. **No concept-layer experiments**: a **concept layer** (planned as
-   the subject of a follow-up paper) is an additional module built on
-   the cap primitive: a set of frozen-identity, sparse-activation
+5. **No concept-layer experiments**: a **concept layer** — an
+   additional module built on the cap primitive — is sketched as an
+   integration path: a set of frozen-identity, sparse-activation
    units placed in parallel to the prediction pipeline. Concept keys
    are frozen (KMeans centroids over embeddings), concept values are
    gradient-trained, and only the top-K concepts fire per position.
@@ -927,8 +927,8 @@ has clear limitations:
    identifiability suggests this path to concept-level stability
    above the substrate **and to concept-conditioned generation**
    (steering output at inference time by pinning specific concept
-   activations). We sketch the integration for both but do not
-   empirically validate either capability in this paper.
+   activations). Empirical validation of concept-layer stability and
+   concept-conditioned generation is left to future work.
 
 6. **Generation quality is unmeasured**: we report only val
    perplexity. Whether the window∈{2,3} model produces qualitatively
@@ -937,13 +937,13 @@ has clear limitations:
 7. **Phase B cap-attention variants use minimal MVP implementations**:
    the cap-memory and cap-pair variants in Section 6.2 are single-head with
    no multi-head structure, and use `NoDiscovery` Xavier init for the
-   cap matrix (no k-means discovery on K/V). A planned **Phase B′**
-   follow-up re-implements both variants with multi-head structure and
-   optional cap discovery on the K/V matrices, settling
-   whether the cap-attention concept itself underperforms or whether
-   the negative result was an artifact of MVP engineering:
+   cap matrix (no k-means discovery on K/V). Fairer multi-head
+   re-implementations of both variants (with optional KMeans discovery
+   on the K/V cap matrices) would settle whether the cap-attention
+   concept itself underperforms or whether the negative result was an
+   artifact of MVP engineering. Candidate configurations include:
 
-   | Phase B′ config | Modification |
+   | Config | Modification |
    |---|---|
    | `capmem_multihead` | Multi-head split (heads=4, d_head=32) |
    | `capmem_multihead_discovered` | Multi-head + KMeans-discovered K/V cap matrix |
@@ -952,14 +952,15 @@ has clear limitations:
 
    Note that RoPE does not naturally apply to these variants (positionless
    cap K, or no Q/K projection from input), so its absence is not a
-   "missing piece" but an architectural consequence. The Phase B′
-   re-implementations isolate the multi-head and discovery effects.
+   "missing piece" but an architectural consequence. This re-evaluation
+   isolates the multi-head and discovery effects and is left to future
+   work.
 
 Future work should address each of these gaps. Of the seven, items 3
 (continual learning), 4 (audit), and 5 (concept stability) test
 AWARE-specific claims that this paper introduces but does not
-validate. Item 7 (Phase B′) clarifies the cap-attention negative
-result. Items 1, 2, and 6 are broader empirical questions.
+validate. Item 7 clarifies the cap-attention negative result. Items
+1, 2, and 6 are broader empirical questions.
 
 ---
 

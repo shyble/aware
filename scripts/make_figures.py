@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate caps_primitive figures.
 
-Produces 5 PNGs into papers/figures/:
+Produces 5 PNGs into papers/caps_primitive/figures/:
   1. window_sweep.png          - val PPL vs cap-input window size
   2. phase_b_comparison.png    - cap-placement comparison bar chart
   3. architecture_cap_input.png   - cap-input mechanism (Config 3)
@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.patches import FancyBboxPatch, FancyArrowPatch
 
-OUTDIR = "papers/figures"
+OUTDIR = "papers/caps_primitive/figures"
 os.makedirs(OUTDIR, exist_ok=True)
 
 plt.rcParams["font.family"] = "sans-serif"
