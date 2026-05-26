@@ -125,11 +125,11 @@ primitive.
 4. **Architectural lessons**: cap-input augmentation with multi-token
    windows behaves as a learned local-context primitive analogous to
    CNN preprocessing. The cap-attention variants tested here are
-   minimal MVP implementations (single-head, no multi-head structure,
-   `NoDiscovery` init for the cap matrix); under these MVP conditions
+   minimal first-pass implementations (single-head, no multi-head structure,
+   `NoDiscovery` init for the cap matrix); under these simplified conditions
    they underperform standard multi-head attention. Whether the
    cap-attention concept itself underperforms, or whether the
-   negative result is an artifact of the MVP engineering, is left to
+   negative result is an artifact of the simplified implementation, is left to
    a planned Phase B′ follow-up (see Section 6.2 caveat and Section 8 item 7) that
    tests fairer multi-head re-implementations with optional KMeans
    discovery on the K/V cap matrices. KMeans bootstrap on
@@ -628,7 +628,7 @@ embedding to attention) or with input caps for Config 4 variants.
 with w=3 is the clear winner; cap-memory variants underperform the
 pure-transformer baseline; cap-pair is parameter-inefficient (2× params
 for sub-baseline gain). Cap-memory and cap-pair are minimal single-head
-MVPs; a fairer multi-head re-implementation is planned (Phase B′,
+first-pass implementations; a fairer multi-head re-implementation is planned (Phase B′,
 Section 8).*
 
 **Cap-memory attention underperforms standard attention** by 4-5 ppl
@@ -637,7 +637,7 @@ parameter-inefficient**: at 2× parameter count it achieves only
 0.7 ppl below the baseline, much worse than the multi-token-window
 gain reported in Section 6.3.
 
-**MVP-implementation caveat**: the cap-memory and cap-pair variants in
+**Implementation caveat**: the cap-memory and cap-pair variants in
 Phase B use minimal single-head implementations with no multi-head
 structure. A fair comparison against multi-head standard attention
 would require multi-head versions of both cap-attention variants (and,
@@ -648,7 +648,7 @@ positionless cap bank (rotating Q alone has no positional meaning),
 and cap-pair has no Q/K projection from input to rotate.
 
 We therefore characterize the Phase B negative result as **"these
-minimal MVP cap-attention implementations underperform multi-head
+minimal first-pass cap-attention implementations underperform multi-head
 standard attention"** rather than **"the cap-attention concept itself
 fails"**. A planned Phase B′ (see Section 8 Future Work) tests fairer
 re-implementations to settle the architectural question.
@@ -934,14 +934,14 @@ has clear limitations:
    perplexity. Whether the window∈{2,3} model produces qualitatively
    better generations than the baseline is unexamined.
 
-7. **Phase B cap-attention variants use minimal MVP implementations**:
+7. **Phase B cap-attention variants use minimal first-pass implementations**:
    the cap-memory and cap-pair variants in Section 6.2 are single-head with
    no multi-head structure, and use `NoDiscovery` Xavier init for the
    cap matrix (no k-means discovery on K/V). Fairer multi-head
    re-implementations of both variants (with optional KMeans discovery
    on the K/V cap matrices) would settle whether the cap-attention
    concept itself underperforms or whether the negative result was an
-   artifact of MVP engineering. Candidate configurations include:
+   artifact of the simplified implementation. Candidate configurations include:
 
    | Config | Modification |
    |---|---|
