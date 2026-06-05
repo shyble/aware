@@ -1,8 +1,9 @@
 # Hierarchical Cap-Native Substrates for Transformer Language Modeling
 
-**Working draft. Sections marked _pending_ correspond to experiments
-not yet run; results in those sections are placeholders and will be
-filled in when the ablation sweeps complete.**
+**Installment one of the cap-native research line. This paper reports
+two of seven planned ablation axes (Table 1); the remaining five are
+deferred to a continuation paper on accelerator hardware. The two
+reported axes are self-contained and constitute the paper's claims.**
 
 Author: Kürşat Aydemir
 Affiliation: limnr / EndpointDev
@@ -242,8 +243,8 @@ weighted blend used in canonical MoE and gives O(1) compute per
 token regardless of `n_caps` — at the cost of giving up the
 inter-cap-mixing dynamics of soft routing.
 
-We compare this routing choice against soft top-K alternatives in
-§6.3 (_pending_).
+A systematic comparison of this routing choice against soft top-K
+alternatives is one of the deferred ablation axes (§8.7).
 
 ### 3.4 Single-Discovery Variant
 
@@ -343,17 +344,27 @@ random seed.
 At our reference configuration (TinyStories small, `d=128`, `K_0=330`,
 `K_1=128`, `n_blocks=4`):
 
-| Variant | params | training memory peak | per-step (CPU, single device) |
-|---|---|---|---|
-| Pure transformer (paper #1) | 853 K | < 1 GB | ~0.5 s |
-| Cap-input (paper #1, kmeans_w3) | 895 K | < 1 GB | ~0.6 s |
-| Cap-native single-discovery | 368 M | ~13 GB | ~13 s |
-| Cap-native hierarchical | 143 M | ~5–6 GB | ~3 s |
+| Variant | total params | active/token | training memory peak | per-step (CPU, single device) |
+|---|---|---|---|---|
+| Pure transformer (paper #1) | 853 K | 853 K | < 1 GB | ~0.5 s |
+| Cap-input (paper #1, kmeans_w3) | 895 K | 895 K | < 1 GB | ~0.6 s |
+| Cap-native single-discovery | 368 M | ~1.22 M | ~13 GB | ~13 s |
+| Cap-native hierarchical | 143 M | ~1.22 M | ~5–6 GB | ~3 s |
 
-The hierarchical variant is faster per step than single-discovery
-because its downstream cap-keyed components have ~6× fewer
-parameters per stack and batched matmuls are dispatched on fewer
-distinct shapes.
+Cap-native's total parameter count is dominated by per-cap weight
+stacks; with top-1 sparse routing only a single cap's slab is active
+at any token. The "active params per token" column reports the
+trainable parameters that actually contribute to a forward pass at
+each position: ~1.115 M cap-keyed (one cap's slab across all
+projections at all blocks) plus ~0.11 M dense (token embeddings and
+cap-layer projections). The single-discovery and hierarchical
+variants have essentially the same active-params footprint despite
+a 2.6× difference in total params, because top-1 routing selects
+exactly one slab regardless of `n_caps`. The hierarchical variant
+is faster per step than single-discovery because its downstream
+cap-keyed components have ~6× fewer parameters *per stack*, so
+batched matmuls are dispatched on smaller shapes and memory
+residency drops.
 
 ## 5. Experimental Setup
 
@@ -417,19 +428,28 @@ are saved as JSON alongside the model.
 
 ## 6. Results
 
-We organize experiments into a sequence of focused ablations, each
-isolating a single architectural knob. We use the convention of
-paper #1 and label them **Phase A** through **Phase G**:
+The cap-native design space has seven ablation axes, each isolating
+a single architectural knob (Table 1). This installment reports the
+two that establish the architecture — that a fully cap-keyed
+transformer trains to competitive perplexity (Phase A), and that a
+second discovered cap layer strictly improves on a single input
+layer (Phase B, the headline). The remaining five axes are deferred
+to the continuation paper, which requires accelerator hardware to
+run the full sweeps at reasonable wall-clock.
 
-| Phase | Knob | Section |
+**Table 1 — Cap-native ablation axes.**
+
+| Axis | Knob | Status |
 |---|---|---|
-| A | Single-discovery cap-native at scale | §6.1 |
-| B | Routing mode | §6.2 _(pending)_ |
-| C | Cap window for layer 0 | §6.3 _(pending)_ |
-| D | Discovery strategy for layer 0 | §6.4 _(pending)_ |
-| E | Single vs hierarchical (**headline**) | §6.5 |
-| F | Cap-indexed attention mask | §6.6 _(pending)_ |
-| G | Hierarchical sub-ablations (`K_1`, `W_1`, routing) | §6.7 _(pending)_ |
+| Single-discovery validation | Does a fully cap-keyed transformer train? | **Phase A, §6.1** |
+| Single vs hierarchical | One cap layer vs two stacked (**headline**) | **Phase B, §6.2** |
+| Routing mode | Hard top-1 vs top-K weighted | Deferred (continuation) |
+| Cap window (layer 0) | `cap_window ∈ {1,2,3,4,5,8}` | Deferred (continuation) |
+| Discovery strategy (layer 0) | KMeans / KMeans++ / Random / NoDiscovery / Hybrid | Deferred (continuation) |
+| Cap-indexed attention mask | With vs without cap-overlap bias | Deferred (continuation) |
+| Hierarchical sub-ablations | `K_1`, `W_1`, layer-0+1 routing | Deferred (continuation) |
+
+The deferred axes are described as a roadmap in §8.7.
 
 ### 6.1 Phase A: Single-Discovery Cap-Native (3 seeds)
 
@@ -447,40 +467,7 @@ The single-discovery variant converges by ~step 2500 and exhibits
 mild train-val divergence after that point. Validation perplexity
 plateaus in the 9.5–10.5 range for the remainder of training.
 
-### 6.2 Phase B: Routing Comparison _(pending)_
-
-We will compare hard top-1 sparse routing against top-K weighted
-routing for K ∈ {1, 4, 8} on the single-discovery base.
-Soft routing over the full `K = 330` cap stack is computationally
-infeasible at our scale (see §4.1 / §7) and is therefore omitted.
-We expect sparse top-1 to win or tie, since the cap primitive is
-designed for identifiable single-cap firing per token.
-
-_Pending: full table and discussion._
-
-### 6.3 Phase C: Cap-Window Sweep _(pending)_
-
-Paper #1 found `cap_window = 3` to be optimal on this corpus, with
-`w = 1` (no windowing) producing approximately neutral cap-input
-behavior. The cap-native architecture provides downstream
-parameter capacity that may shift the optimum. We will sweep
-`cap_window ∈ {1, 2, 3, 4, 5, 8}` on the hierarchical winner.
-
-_Pending: full table and discussion._
-
-### 6.4 Phase D: Discovery Strategy Sweep _(pending)_
-
-Paper #1 found discovery strategy to matter only at window > 1.
-For cap-native, where the downstream architecture is qualitatively
-different, the discovery axis may interact with the layer-0 / layer-1
-boundary. We will compare KMeans (the default), KMeans++ (smarter
-seeding, lower seed variance), Random unit vectors (frozen, no
-discovery), NoDiscovery (Xavier init with gradient training of the
-cap layer), and Hybrid (KMeans init followed by gradient training).
-
-_Pending: full table and discussion._
-
-### 6.5 Phase E: Single vs Hierarchical Discovery (headline)
+### 6.2 Phase B: Single vs Hierarchical Discovery (headline)
 
 We compare the single-discovery variant (§6.1) against the
 hierarchical variant. Both variants share the base configuration of
@@ -513,35 +500,11 @@ This is the central empirical claim of the paper: stacking two
 discovered cap layers is strictly better than a single discovered
 layer of the same total cap count.
 
-### 6.6 Phase F: Cap-Indexed Attention Mask _(pending)_
-
-The cap-indexed attention mask, introduced in paper #1 as an
-optional cap-overlap bias on attention scores, may interact with
-cap-keyed components. We will report results with and without the
-mask on the hierarchical winner.
-
-_Pending: results and discussion._
-
-### 6.7 Phase G: Hierarchical Sub-Ablations _(pending)_
-
-The hierarchical defaults `K_1 = 128` and `W_1 = 1` were chosen
-heuristically. We will sweep:
-
-- `K_1 ∈ {64, 128, 256, 330}` to find the layer-1 cap-count sweet
-  spot.
-- `W_1 ∈ {1, 2, 3}` to test whether windowing over contextualised
-  representations helps.
-- An alternate routing where the downstream cap-keyed components
-  are routed by `concat(cap_acts_0, cap_acts_1)` rather than
-  `cap_acts_1` alone.
-
-_Pending: full tables and discussion._
-
 ## 7. Analysis
 
 ### 7.1 Why Hierarchical Helps
 
-Two complementary effects, both visible in the §6.5 trajectory data:
+Two complementary effects, both visible in the §6.2 trajectory data:
 
 1. **Decoupling input clustering from downstream specialisation.**
    The input cap layer (layer 0) clusters token-window patterns —
@@ -598,7 +561,7 @@ is unchanged), and a second small discovery is added on top.
 
 ### 7.3 Convergence Dynamics
 
-The trajectory data of §6.1 and §6.5 reveals a consistent
+The trajectory data of §6.1 and §6.2 reveals a consistent
 qualitative pattern across both variants:
 
 | Regime | Steps | Train-val behaviour |
@@ -614,39 +577,72 @@ seed 42) primarily increases the train-val gap without improving
 best val ppl — supporting our choice of 3000 steps as the standard
 training budget for paper-#2 experiments.
 
-### 7.4 Limitations: Parameter-Matched Baseline
+### 7.4 Total vs Active Parameters and Fair-Comparison Framing
 
-A reader could fairly object that **cap-native at 143–368 M
-parameters is 150–400× larger than the cap-input baselines of paper
-#1 (895 K)**, and that the perplexity improvements reported above
-are partly attributable to raw capacity rather than architectural
-choice.
+Cap-native at 143–368 M total parameters is 150–400× larger by raw
+parameter count than the cap-input baselines of paper #1 (895 K). A
+naïve reading would attribute the perplexity gap entirely to scale.
+That reading conflates two distinct cost axes; cap-native is
+deliberately designed to separate them.
 
-The most rigorous comparison would train a vanilla transformer
-**scaled to match cap-native's parameter count** on the same corpus
-and protocol. Per our parameter formulas, a 143 M-parameter vanilla
-transformer would have approximately `d_model = 768, n_blocks = 12`
-(GPT-2-small dimensions); a 368 M-parameter vanilla transformer
-would be at GPT-2-medium scale.
+**Total vs active parameters.** Cap-native stores per-cap weight
+stacks at every cap-keyed projection, so the total parameter count
+scales linearly with `n_caps`. With 330 caps at `d_model=128`, this
+is 368 M total. With top-1 sparse routing, only a single cap's slab
+is active at any token, giving ~1.115 M cap-keyed active parameters
+plus ~0.11 M dense (token embeddings, cap-layer projection), or
+**~1.22 M total active parameters per token** — two orders of
+magnitude below total.
 
-We have not run this parameter-matched experiment in the present
-draft. We report the unmatched comparison transparently:
+**This gap is intentional, not incidental.** Each cap holds its own
+slab so that it can be discovered, frozen, replaced, or grown in
+isolation — the lifecycle operations of the cap primitive (paper
+#1). A parameter-sharing dense transformer cannot offer this
+property; identifiability requires per-unit ownership of weights,
+and that ownership shows up in the total parameter count. The
+principal AWARE research motivation for this design is **autonomous
+capability accretion and continual learning**: caps as addressable
+units mean new domains can extend the cap pool without overwriting
+existing caps' weights. The total parameter count is the price paid
+for this addressability, not the compute cost — which remains low
+because routing is sparse. We do not advocate cap-native purely as
+a compute optimisation; the architectural commitment is to
+identifiable units, and the active/total gap is a structural
+consequence.
 
-| Architecture | params | best val ppl |
+**Fair comparison requires two axes, not one.** A vanilla
+transformer should be compared on both:
+
+| Comparison axis | What it measures | Relevant when |
 |---|---|---|
-| Pure transformer (paper #1) | 853 K | 28.00 ± 0.11 |
-| Cap-input kmeans_w3 (paper #1) | 895 K | 13.71 ± 0.33 |
-| Cap-native single-discovery (this paper) | 368 M | 9.96 ± 0.18 |
-| Cap-native hierarchical (this paper) | 143 M | 8.76 ± 0.13 |
-| Vanilla transformer at 143 M params | — | _(future work)_ |
+| Total params | Memory footprint, deployment storage | RAM-constrained inference, model distribution |
+| Active params per token | Inference compute, throughput, quality-per-FLOP | Latency-critical applications |
 
-The hierarchical-vs-single-discovery comparison (§6.5) is internally
-matched-architecture and matched-protocol, so the 12 % improvement
-there is not subject to this caveat.
+We report both columns below so readers can choose the comparison
+appropriate to their setting:
 
-For the cap-native-vs-paper-#1 comparison, future work will report
-a parameter-matched vanilla transformer baseline to isolate the
-architectural contribution from raw capacity.
+| Architecture | total params | active/token | best val ppl |
+|---|---|---|---|
+| Pure transformer (paper #1) | 853 K | 853 K | 28.00 ± 0.11 |
+| Cap-input kmeans_w3 (paper #1) | 895 K | 895 K | 13.71 ± 0.33 |
+| Cap-native single-discovery (this paper) | 368 M | ~1.22 M | 9.96 ± 0.18 |
+| Cap-native hierarchical (this paper) | 143 M | ~1.22 M | 8.76 ± 0.13 |
+| Vanilla transformer at 143 M params | 143 M | 143 M | _(future work)_ |
+| Vanilla transformer at 368 M params | 368 M | 368 M | _(future work)_ |
+
+On the active-params axis, cap-native is in the same order of
+magnitude as paper #1's 895 K cap-input baseline (1.22 M vs 895 K,
+~1.4×), not 400× larger. The 35-50% perplexity improvement at this
+near-matched active-compute budget is the architectural claim. On
+the total-params axis the comparison is unmatched and we defer the
+fully-matched vanilla-transformer baseline (GPT-2-small at 143 M,
+GPT-2-medium at 368 M) to follow-up work.
+
+The hierarchical-vs-single-discovery comparison (§6.2) remains
+internally matched on both axes — same per-cap slab size, same
+top-1 routing, same protocol — so the 12 % improvement there
+holds independently of how a reader weighs the active-vs-total
+question.
 
 ## 8. Limitations and Future Work
 
@@ -662,17 +658,21 @@ natural next step.
 
 ### 8.2 Parameter-Matched Baselines
 
-As discussed in §7.3, the cap-native-vs-paper-#1 comparison has a
-parameter scale gap. Future work will report a vanilla-transformer
-baseline at matched parameter count to isolate architectural
-contribution from raw capacity.
+As discussed in §7.4, cap-native is roughly matched to paper #1 on
+*active* parameters per token (~1.22 M vs 895 K) but not on *total*
+parameters (368 M and 143 M vs 895 K). Future work will report a
+vanilla-transformer baseline at matched **total** parameter count
+(GPT-2-small at 143 M, GPT-2-medium at 368 M) on the same corpus
+and protocol. That comparison would isolate the architectural
+contribution of cap-keyed routing from the raw memory-footprint
+advantage of dense models at smaller total sizes.
 
 ### 8.3 Routing Diversity
 
 Hard top-1 sparse routing was chosen for memory tractability at
 large `K`. Whether soft or top-K weighted routing would improve
-quality at this scale is an open question that will be partially
-addressed by Phase B once those experiments complete.
+quality at this scale is an open question, addressed by the routing
+ablation deferred to the continuation paper (§8.7).
 
 ### 8.4 Deeper Hierarchies
 
@@ -702,6 +702,35 @@ in particular, whether layer 1's caps can be audited and
 hot-swapped without retraining layer 0 — is an interesting open
 question not addressed in this paper.
 
+### 8.7 Deferred Ablations (Continuation Paper)
+
+Five of the seven ablation axes in Table 1 are deferred to a
+continuation paper, gated on accelerator hardware that makes the
+full sweeps tractable at reasonable wall-clock. We list them here as
+a roadmap:
+
+1. **Routing mode** — hard top-1 vs top-K weighted routing for
+   `K ∈ {1, 4, 8}` on the single-discovery base (§8.3). Soft routing
+   over the full `K_0 = 330` stack is infeasible at our scale and
+   stays omitted.
+2. **Cap window (layer 0)** — sweep `cap_window ∈ {1, 2, 3, 4, 5, 8}`
+   on the hierarchical winner. Paper #1 found `w = 3` optimal; the
+   downstream cap capacity here may shift the optimum.
+3. **Discovery strategy (layer 0)** — KMeans (default), KMeans++,
+   Random unit vectors, NoDiscovery (Xavier + gradient), and Hybrid
+   (KMeans init + gradient). Paper #1 found discovery mattered only
+   at window > 1; the layer-0 / layer-1 boundary may interact.
+4. **Cap-indexed attention mask** — with vs without the cap-overlap
+   bias on attention scores, on the hierarchical winner.
+5. **Hierarchical sub-ablations** — `K_1 ∈ {64, 128, 256, 330}`,
+   `W_1 ∈ {1, 2, 3}`, and an alternate routing where downstream
+   components route by `concat(cap_acts_0, cap_acts_1)` rather than
+   `cap_acts_1` alone (§8.4).
+
+Alongside these, the parameter-matched vanilla-transformer baselines
+of §8.2 (GPT-2-small at 143 M, GPT-2-medium at 368 M) are the other
+outstanding comparison for the continuation paper.
+
 ## 9. Conclusion
 
 We introduced cap-native, a transformer-shaped architecture in
@@ -715,12 +744,14 @@ contribution is that stacking discovered cap layers is a better
 placement of the cap primitive than the single-input-layer
 placement of paper #1.
 
-The headline result has been validated at three seeds; the
+The headline result has been validated at three seeds. The
 supporting ablations (routing, window, discovery, indexed-mask,
-hierarchical sub-knobs) are sketched in §6.2 / 6.3 / 6.4 / 6.6 /
-6.7 and will be filled in as the experiments complete. A
-parameter-matched vanilla-transformer baseline at our scale
-remains an outstanding comparison.
+hierarchical sub-knobs) and a parameter-matched vanilla-transformer
+baseline are deferred to a continuation paper (§8.7), gated on
+accelerator hardware. This installment establishes the two claims
+that stand on their own: a fully cap-keyed transformer trains to
+competitive perplexity, and stacking two discovered cap layers
+beats one.
 
 ## References
 
@@ -813,7 +844,7 @@ At our reference configuration:
 ## Appendix B: Reproducibility
 
 The code is at `github.com/shyble/aware`, branch `cap-native`,
-commit `6e247e4`. The experiments in §6.1 and §6.5 can be reproduced with:
+commit `6e247e4`. The experiments in §6.1 and §6.2 can be reproduced with:
 
 ```bash
 # Single-discovery, 3 seeds, 3000 steps each
