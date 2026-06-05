@@ -1,4 +1,4 @@
-# Hierarchical Cap-Native Substrates for Transformer Language Modeling
+# Hierarchical Cap-Native Substrates for Language Modeling
 
 **Installment one of the cap-native research line. This paper reports
 two of seven planned ablation axes (Table 1); the remaining five are
@@ -36,11 +36,11 @@ study two variants:
 
 On TinyStories (small split, ~3.5 M tokens), at matched training
 budget (3000 steps, 3 random seeds), hierarchical cap-native achieves
-**val_ppl 8.76 ± 0.13** with 143 M parameters, outperforming
-single-discovery cap-native (9.84 ± 0.32, 368 M params) while using
-**2.6× fewer parameters** and exhibiting **2.5× tighter run-to-run
+**val_ppl 8.76 +/- 0.13** with 143 M parameters, outperforming
+single-discovery cap-native (9.96 +/- 0.18, 368 M params) while using
+**2.6× fewer parameters** and exhibiting **~1.4× tighter run-to-run
 variance**. Both variants improve substantially over the cap-input
-baseline of paper #1 (13.71 ± 0.33, 895 K params), though that
+baseline of paper #1 (13.71 +/- 0.33, 895 K params), though that
 comparison is at unmatched parameter scale and we discuss this
 caveat at length.
 
@@ -88,9 +88,9 @@ every block?
 3. **Empirical evaluation.** On TinyStories (small split, ~3.5 M
    tokens) at matched training budget, hierarchical cap-native at
    143 M parameters beats single-discovery cap-native at 368 M
-   parameters by 11 % perplexity and runs ~4× faster end-to-end.
+   parameters by 12 % perplexity and runs ~4× faster end-to-end.
    It is also more consistent across seeds (standard deviation
-   2.5× tighter).
+   ~1.4× tighter).
 
 4. **Bounded grouped dispatch.** Cap-keyed weight stacks at large
    `n_caps` are dispatch-bound on every modern accelerator. We
@@ -461,7 +461,7 @@ We train cap-native single-discovery at the base configuration of
 | 42 | 9.89 | 3000 (synthesized from 5000-step run; see Appendix) | 9.89 |
 | 123 | 10.16 | 2400 | 10.47 |
 | 7 | 9.83 | 2500 | 10.09 |
-| **mean ± std** | **9.96 ± 0.18** | — | **10.15 ± 0.29** |
+| **mean +/- std** | **9.96 +/- 0.18** | — | **10.15 +/- 0.29** |
 
 The single-discovery variant converges by ~step 2500 and exhibits
 mild train-val divergence after that point. Validation perplexity
@@ -481,14 +481,14 @@ hierarchical variant. Both variants share the base configuration of
 | 42 | 8.91 | 3000 | 8.91 |
 | 123 | 8.72 | 2900 | 9.12 |
 | 7 | 8.66 | 2500 | 8.84 |
-| **mean ± std** | **8.76 ± 0.13** | — | **8.96 ± 0.15** |
+| **mean +/- std** | **8.76 +/- 0.13** | — | **8.96 +/- 0.15** |
 
 #### Headline comparison
 
-| Architecture | Best val ppl ± std | Final val ppl ± std | Parameters |
+| Architecture | Best val ppl +/- std | Final val ppl +/- std | Parameters |
 |---|---|---|---|
-| Single-discovery | 9.96 ± 0.18 | 10.15 ± 0.29 | 368 M |
-| **Hierarchical** | **8.76 ± 0.13** | **8.96 ± 0.15** | **143 M** |
+| Single-discovery | 9.96 +/- 0.18 | 10.15 +/- 0.29 | 368 M |
+| **Hierarchical** | **8.76 +/- 0.13** | **8.96 +/- 0.15** | **143 M** |
 | Δ (hier vs single) | **-12 %** | **-12 %** | **2.6× fewer params** |
 
 Hierarchical cap-native outperforms single-discovery cap-native by
@@ -530,7 +530,7 @@ Two complementary effects, both visible in the §6.2 trajectory data:
    "bottlenecks" downstream routing through a smaller cap basis.
    This reduces the effective number of cap-keyed parameters by
    ~2.5× and constrains overfitting. The tighter run-to-run
-   variance (std 0.13 vs 0.32) and the smaller train-val gap at
+   variance (std 0.13 vs 0.18) and the smaller train-val gap at
    the end of training (~3 ppl gap for hier vs ~5 ppl gap for
    single-discovery at step 3000) are both consistent with this
    regularisation interpretation.
@@ -623,10 +623,10 @@ appropriate to their setting:
 
 | Architecture | total params | active/token | best val ppl |
 |---|---|---|---|
-| Pure transformer (paper #1) | 853 K | 853 K | 28.00 ± 0.11 |
-| Cap-input kmeans_w3 (paper #1) | 895 K | 895 K | 13.71 ± 0.33 |
-| Cap-native single-discovery (this paper) | 368 M | ~1.22 M | 9.96 ± 0.18 |
-| Cap-native hierarchical (this paper) | 143 M | ~1.22 M | 8.76 ± 0.13 |
+| Pure transformer (paper #1) | 853 K | 853 K | 28.00 +/- 0.11 |
+| Cap-input kmeans_w3 (paper #1) | 895 K | 895 K | 13.71 +/- 0.33 |
+| Cap-native single-discovery (this paper) | 368 M | ~1.22 M | 9.96 +/- 0.18 |
+| Cap-native hierarchical (this paper) | 143 M | ~1.22 M | 8.76 +/- 0.13 |
 | Vanilla transformer at 143 M params | 143 M | 143 M | _(future work)_ |
 | Vanilla transformer at 368 M params | 368 M | 368 M | _(future work)_ |
 
@@ -739,7 +739,7 @@ adding a second discovered cap layer over contextualised
 representations (the hierarchical variant) outperforms a single
 discovered cap layer (the single-discovery variant) by 12 %
 validation perplexity, while using 2.6× fewer parameters and
-exhibiting 2.5× tighter run-to-run variance. The architectural
+exhibiting ~1.4× tighter run-to-run variance. The architectural
 contribution is that stacking discovered cap layers is a better
 placement of the cap primitive than the single-input-layer
 placement of paper #1.
