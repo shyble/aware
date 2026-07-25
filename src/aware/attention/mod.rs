@@ -20,10 +20,19 @@ pub enum AttentionKind {
     Standard,
     /// Caps as memory: Q from input, K & V from a CapMatrix.
     /// Positions attend to caps; T × n_caps attention pattern.
-    CapMemory { source: CapMatrixSource },
+    CapMemory {
+        source: CapMatrixSource,
+        /// How a block-local cap matrix is initialised. `NoDiscovery`
+        /// (Xavier) reproduces the paper's first-pass variant; `KMeans`
+        /// discovers K/V from an embedding sample.
+        discovery: super::discover::DiscoveryKind,
+    },
     /// Capsule-style routing: cap_acts (from a CapMatrix fired on input)
     /// drive attention scores via cap-pair affinity matrix A_pair.
-    CapPair { source: CapMatrixSource },
+    CapPair {
+        source: CapMatrixSource,
+        discovery: super::discover::DiscoveryKind,
+    },
 }
 
 pub trait Attention: Send + Sync {

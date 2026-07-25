@@ -31,6 +31,10 @@ pub struct CapStats {
 pub struct BlockBuildCtx<'a> {
     pub shared_cap_keys: Option<&'a Tensor>,
     pub shared_cap_values: Option<&'a Tensor>,
+    /// Per-token embedding sample [N, d_model], for block-local cap
+    /// matrices that use a data-driven discovery strategy (KMeans).
+    /// Without it, KMeans degrades to random unit vectors.
+    pub bootstrap_sample: Option<&'a Tensor>,
 }
 
 impl<'a> BlockBuildCtx<'a> {
@@ -38,6 +42,7 @@ impl<'a> BlockBuildCtx<'a> {
         Self {
             shared_cap_keys: None,
             shared_cap_values: None,
+            bootstrap_sample: None,
         }
     }
 }
@@ -360,9 +365,33 @@ impl SubstrateBuilder {
         let shared_values_clone = shared_cap_matrix
             .as_ref()
             .and_then(|m| m.values.as_ref().cloned());
+
+        // Per-token (window=1) embedding sample, shape [N, d_model]. Block-local
+        // cap matrices and the concept layer both cluster over single tokens, so
+        // when the cap layer used a windowed sample we take the first token of
+        // each window instead of re-using the concatenated windows.
+        let per_token_sample: Option<Tensor> = if let Some(toks) = &self.bootstrap_sample_tokens {
+            let n_total = toks.len();
+            if n_total == 0 {
+                None
+            } else if cap_window > 1 {
+                let n_windows = n_total / cap_window;
+                let first_tokens: Vec<u32> =
+                    (0..n_windows).map(|i| toks[i * cap_window]).collect();
+                let tt = Tensor::from_vec(first_tokens, (n_windows,), &self.device)?
+                    .to_dtype(DType::U32)?;
+                Some(embed.forward(&tt)?)
+            } else {
+                bootstrap_sample.clone()
+            }
+        } else {
+            None
+        };
+
         let ctx = BlockBuildCtx {
             shared_cap_keys: shared_keys_clone.as_ref(),
             shared_cap_values: shared_values_clone.as_ref(),
+            bootstrap_sample: per_token_sample.as_ref(),
         };
 
         // The substrate owns one RoPE shared by every block, so it must be
@@ -401,37 +430,9 @@ impl SubstrateBuilder {
         // samples (the bootstrap_sample we already prepared). Concept keys
         // are frozen; values are gradient-trained.
         let concept_layer = if let Some(ccfg) = self.concept_config {
-            // For concept layer we want per-token (window=1) sample, not
-            // windowed. If the cap layer used windowed samples, we re-
-            // embed the raw tokens here.
-            let single_token_sample: Option<Tensor> =
-                if let Some(toks) = &self.bootstrap_sample_tokens {
-                    let n_total = toks.len();
-                    let cap_window = self
-                        .cap_config
-                        .as_ref()
-                        .map(|c| c.cap_window.max(1))
-                        .unwrap_or(1);
-                    if n_total == 0 {
-                        None
-                    } else if cap_window > 1 {
-                        // Sample was originally [N_windows*K, d_emb]. For
-                        // concept-layer (window=1), we use just the first token
-                        // of each window - those are still per-token samples.
-                        let n_windows = n_total / cap_window;
-                        let first_tokens: Vec<u32> =
-                            (0..n_windows).map(|i| toks[i * cap_window]).collect();
-                        let tt = Tensor::from_vec(first_tokens, (n_windows,), &self.device)?
-                            .to_dtype(DType::U32)?;
-                        Some(embed.forward(&tt)?)
-                    } else {
-                        // Already per-token. Reuse the bootstrap_sample we
-                        // computed for the cap layer (it has the same shape).
-                        bootstrap_sample.clone()
-                    }
-                } else {
-                    None
-                };
+            // The concept layer clusters per-token (window=1) samples, which
+            // is the same sample the block-local cap matrices use.
+            let single_token_sample: Option<Tensor> = per_token_sample.clone();
 
             Some(ConceptLayer::new(
                 ccfg,

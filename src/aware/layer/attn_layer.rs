@@ -30,16 +30,20 @@ impl AttnLayer {
             AttentionKind::Standard => {
                 Box::new(StandardAttention::new(vcfg, bcfg.n_heads, vb.pp("attn"))?)
             }
-            AttentionKind::CapMemory { source } => Box::new(CapMemoryAttention::new(
+            AttentionKind::CapMemory { source, discovery } => Box::new(CapMemoryAttention::new(
                 vcfg,
                 source,
+                bcfg.n_heads,
+                *discovery,
                 device,
                 ctx,
                 vb.pp("attn"),
             )?),
-            AttentionKind::CapPair { source } => Box::new(CapPairAttention::new(
+            AttentionKind::CapPair { source, discovery } => Box::new(CapPairAttention::new(
                 vcfg,
                 source,
+                bcfg.n_heads,
+                *discovery,
                 device,
                 ctx,
                 vb.pp("attn"),

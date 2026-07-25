@@ -81,13 +81,45 @@ case "$CONFIG_ID" in
         ARGS=(AWARE_BENCH_ATTENTION=standard AWARE_BENCH_INCLUDE_CAP_LAYER=true
               AWARE_BENCH_CAP_DISCOVERY=kmeans AWARE_BENCH_CAP_WINDOW=8)
         ;;
+    # Paper #1 Phase B as published: single-head, NoDiscovery (Xavier) cap
+    # matrix. n_heads=1 is pinned explicitly because the cap-attention
+    # variants are now multi-head capable and default to 4 heads; pinning it
+    # keeps these presets reproducing the numbers in Section 6.2.
     capmem)
         ARGS=(AWARE_BENCH_ATTENTION=cap_memory AWARE_BENCH_CAP_SOURCE=local
-              AWARE_BENCH_INCLUDE_CAP_LAYER=false)
+              AWARE_BENCH_INCLUDE_CAP_LAYER=false
+              AWARE_BENCH_N_HEADS=1 AWARE_BENCH_CAP_ATTN_DISCOVERY=nodiscovery)
         ;;
     cappair)
         ARGS=(AWARE_BENCH_ATTENTION=cap_pair AWARE_BENCH_CAP_SOURCE=local
-              AWARE_BENCH_INCLUDE_CAP_LAYER=false)
+              AWARE_BENCH_INCLUDE_CAP_LAYER=false
+              AWARE_BENCH_N_HEADS=1 AWARE_BENCH_CAP_ATTN_DISCOVERY=nodiscovery)
+        ;;
+
+    # ── Phase B' : fair cap-attention re-implementations (paper #1 §8 item 7) ──
+    # The published Phase B compared single-head cap-attention against
+    # multi-head standard attention. These presets isolate the two suspected
+    # confounds — head count and cap-matrix discovery — one at a time.
+    # Head count is the only variable between capmem and capmem_multihead.
+    capmem_multihead)
+        ARGS=(AWARE_BENCH_ATTENTION=cap_memory AWARE_BENCH_CAP_SOURCE=local
+              AWARE_BENCH_INCLUDE_CAP_LAYER=false
+              AWARE_BENCH_N_HEADS=4 AWARE_BENCH_CAP_ATTN_DISCOVERY=nodiscovery)
+        ;;
+    capmem_multihead_discovered)
+        ARGS=(AWARE_BENCH_ATTENTION=cap_memory AWARE_BENCH_CAP_SOURCE=local
+              AWARE_BENCH_INCLUDE_CAP_LAYER=false
+              AWARE_BENCH_N_HEADS=4 AWARE_BENCH_CAP_ATTN_DISCOVERY=kmeans)
+        ;;
+    cappair_multihead)
+        ARGS=(AWARE_BENCH_ATTENTION=cap_pair AWARE_BENCH_CAP_SOURCE=local
+              AWARE_BENCH_INCLUDE_CAP_LAYER=false
+              AWARE_BENCH_N_HEADS=4 AWARE_BENCH_CAP_ATTN_DISCOVERY=nodiscovery)
+        ;;
+    cappair_multihead_kmeans)
+        ARGS=(AWARE_BENCH_ATTENTION=cap_pair AWARE_BENCH_CAP_SOURCE=local
+              AWARE_BENCH_INCLUDE_CAP_LAYER=false
+              AWARE_BENCH_N_HEADS=4 AWARE_BENCH_CAP_ATTN_DISCOVERY=kmeans)
         ;;
 
     # ── Cap-native architecture configs ──

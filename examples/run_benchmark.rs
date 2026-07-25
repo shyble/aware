@@ -85,9 +85,13 @@ fn parse_attention(s: &str) -> AttentionKind {
             n_caps: env_usize("AWARE_BENCH_CAP_N", 512),
         },
     };
+    // Discovery for the attention-side cap matrix. `nodiscovery` (Xavier)
+    // reproduces the paper's first-pass Phase B variants; `kmeans` discovers
+    // K/V from an embedding sample (Phase B' "discovered" configs).
+    let discovery = parse_discovery(&env_str("AWARE_BENCH_CAP_ATTN_DISCOVERY", "nodiscovery"));
     match s {
-        "cap_memory" => AttentionKind::CapMemory { source },
-        "cap_pair" => AttentionKind::CapPair { source },
+        "cap_memory" => AttentionKind::CapMemory { source, discovery },
+        "cap_pair" => AttentionKind::CapPair { source, discovery },
         _ => AttentionKind::Standard,
     }
 }
@@ -298,7 +302,20 @@ fn main() -> Result<()> {
             cap_window,
             ..Default::default()
         });
-        // KMeans / Hybrid actually use the sample; others ignore it.
+    }
+
+    // Block-local cap-attention matrices cluster over the same per-token
+    // sample the input cap layer uses. Without a sample KMeans silently
+    // falls back to random unit vectors, so supply it whenever either the
+    // cap layer or a cap-attention variant asks for data-driven discovery.
+    // (Phase B runs with include_cap_layer=false, so the attention check
+    // is what makes the "discovered" configs actually discovered.)
+    let attn_wants_sample = matches!(
+        &attention,
+        AttentionKind::CapMemory { discovery, .. } | AttentionKind::CapPair { discovery, .. }
+            if !matches!(discovery, DiscoveryKind::NoDiscovery)
+    );
+    if include_cap_layer || attn_wants_sample {
         builder = builder.with_bootstrap_sample_tokens(bootstrap_tokens);
     }
     let block = BlockBuilder::new()
