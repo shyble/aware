@@ -116,6 +116,16 @@ case "$CONFIG_ID" in
               AWARE_BENCH_INCLUDE_CAP_LAYER=false
               AWARE_BENCH_N_HEADS=4 AWARE_BENCH_CAP_ATTN_DISCOVERY=nodiscovery)
         ;;
+    # A_pair scales as heads x n_caps^2, so the multi-head variant above has
+    # ~4x the affinity parameters of single-head cappair. Halving n_caps while
+    # quadrupling heads matches them exactly (4 x 256^2 == 1 x 512^2), which
+    # separates "multi-head helps" from "more capacity helps".
+    cappair_multihead_matched)
+        ARGS=(AWARE_BENCH_ATTENTION=cap_pair AWARE_BENCH_CAP_SOURCE=local
+              AWARE_BENCH_INCLUDE_CAP_LAYER=false
+              AWARE_BENCH_N_HEADS=4 AWARE_BENCH_CAP_N=256
+              AWARE_BENCH_CAP_ATTN_DISCOVERY=nodiscovery)
+        ;;
     cappair_multihead_kmeans)
         ARGS=(AWARE_BENCH_ATTENTION=cap_pair AWARE_BENCH_CAP_SOURCE=local
               AWARE_BENCH_INCLUDE_CAP_LAYER=false
