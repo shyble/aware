@@ -19,9 +19,9 @@ default = ["candle"]
 # CPU candle backend (default)
 candle = ["candle-core", "candle-nn"]
 # CUDA backend (Linux/Windows): cargo build --features cuda
-cuda = ["candle", "candle-core/cuda"]
+cuda = ["candle", "candle-core/cuda", "candle-nn/cuda"]
 # Apple Metal backend (Apple Silicon): cargo build --features metal
-metal = ["candle", "candle-core/metal"]
+metal = ["candle", "candle-core/metal", "candle-nn/metal"]
 
 [lib]
 name = "aware"
