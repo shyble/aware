@@ -335,3 +335,13 @@ pub fn load_bpe(dir: &str) -> std::io::Result<BPETokenizer> {
     bincode::deserialize(&bpe_bytes)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
+
+/// Save a BPE tokenizer to `dir/bpe.bin`, creating the directory if needed.
+/// A tokenizer trained on one corpus fragments a different one badly, so
+/// each corpus should get its own directory.
+pub fn save_bpe(bpe: &BPETokenizer, dir: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let bytes = bincode::serialize(bpe)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    std::fs::write(format!("{}/bpe.bin", dir), bytes)
+}

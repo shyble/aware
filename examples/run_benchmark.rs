@@ -45,7 +45,7 @@ use aware::aware::{
     AttentionKind, BlockBuilder, CapConfig, DiscoveryKind, LossKind, OptimizerKind,
     StreamingFeeder, Substrate,
 };
-use aware::data::bpe::load_bpe;
+use aware::data::bpe::{load_bpe, save_bpe};
 use aware::data::bpe::BPETokenizer;
 use candle_core::{Device, Result};
 use candle_nn::Optimizer;
@@ -198,10 +198,27 @@ fn main() -> Result<()> {
         std::process::exit(1)
     });
 
-    let bpe = match load_bpe("data/brain_tinystories") {
-        Ok(b) => b,
-        Err(_) => BPETokenizer::train(&corpus, 256),
+    // Tokenizer provenance is explicit: a BPE trained on one corpus
+    // fragments a different one badly, which would show up as an
+    // architecture result rather than a tokenizer mismatch. Defaults to the
+    // TinyStories tokenizer behind the published paper-#1 numbers; point
+    // AWARE_BENCH_BPE_DIR at a fresh directory for any other corpus and a
+    // tokenizer is trained on it and cached there.
+    let bpe_dir = env_str("AWARE_BENCH_BPE_DIR", "data/brain_tinystories");
+    let (bpe, bpe_origin) = match load_bpe(&bpe_dir) {
+        Ok(b) => (b, format!("loaded from {}", bpe_dir)),
+        Err(_) => {
+            let b = BPETokenizer::train(&corpus, 256);
+            match save_bpe(&b, &bpe_dir) {
+                Ok(()) => (b, format!("trained on corpus, cached in {}", bpe_dir)),
+                Err(e) => {
+                    let msg = format!("trained on corpus (not cached: {})", e);
+                    (b, msg)
+                }
+            }
+        }
     };
+    println!("  bpe:             {} (vocab {})", bpe_origin, bpe.vocab_size());
     let train_all: Vec<u32> = bpe.encode(&corpus).into_iter().map(|t| t as u32).collect();
     drop(corpus);
     println!(
