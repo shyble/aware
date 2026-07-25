@@ -365,6 +365,16 @@ impl SubstrateBuilder {
             shared_cap_values: shared_values_clone.as_ref(),
         };
 
+        // The substrate owns one RoPE shared by every block, so it must be
+        // sized to the head dimension the attention layers actually use
+        // (d_model / n_heads). Capture it before the loop consumes the configs.
+        let attn_heads = self
+            .blocks
+            .first()
+            .map(|b| b.n_heads)
+            .unwrap_or_else(|| BlockConfig::default().n_heads)
+            .max(1);
+
         let mut blocks = Vec::with_capacity(self.blocks.len());
         for (i, bcfg) in self.blocks.into_iter().enumerate() {
             let block = Block::new(
@@ -378,7 +388,7 @@ impl SubstrateBuilder {
         }
 
         let final_ln = RmsNorm::new(self.vcfg.d_model, self.vcfg.norm_eps, vb.pp("final_ln"))?;
-        let d_k = self.vcfg.d_model / 4; // default; will be overridden by attention's actual d_k
+        let d_k = self.vcfg.d_model / attn_heads;
         let rope = RoPE::new(
             d_k,
             self.vcfg.max_seq_len,
