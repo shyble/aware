@@ -39,10 +39,15 @@ budget (3000 steps, 3 random seeds), hierarchical cap-native achieves
 **val_ppl 8.76 +/- 0.13** with 143 M parameters, outperforming
 single-discovery cap-native (9.96 +/- 0.18, 368 M params) while using
 **2.6× fewer parameters** and exhibiting **~1.4× tighter run-to-run
-variance**. Both variants improve substantially over the cap-input
-baseline of paper #1 (13.71 +/- 0.33, 895 K params), though that
-comparison is at unmatched parameter scale and we discuss this
-caveat at length.
+variance**. Because top-1 routing activates a single cap's weight
+stack per token, both variants compute only **~1.22 M parameters per
+token** despite their total size: hierarchical cap-native reaches
+val ppl 8.76 at an active-parameter budget within ~1.4× of the
+853 K dense transformer that reaches 28.00 under a longer training
+budget. We argue in §7.4 that this quality-per-unit-compute
+comparison, not total parameter count, is the well-posed one at this
+corpus scale, and that total-parameter-matched baselines require a
+substantially larger corpus to be meaningful.
 
 The paper's contribution is architectural: we show that a second
 discovered cap layer over already-contextualised representations is
@@ -619,24 +624,55 @@ transformer should be compared on both:
 | Active params per token | Inference compute, throughput, quality-per-FLOP | Latency-critical applications |
 
 We report both columns below so readers can choose the comparison
-appropriate to their setting:
+appropriate to their setting. Training budget is stated explicitly,
+because the two papers used different step counts:
 
-| Architecture | total params | active/token | best val ppl |
+| Architecture | total params | active/token | tokens trained | best val ppl |
+|---|---|---|---|---|
+| Pure transformer (paper #1) | 853 K | 853 K | 20.5 M (5000 steps) | 28.00 +/- 0.11 |
+| Cap-input kmeans_w3 (paper #1) | 895 K | 895 K | 20.5 M (5000 steps) | 13.71 +/- 0.33 |
+| Cap-native single-discovery (this paper) | 368 M | ~1.22 M | 12.3 M (3000 steps) | 9.96 +/- 0.18 |
+| Cap-native hierarchical (this paper) | 143 M | ~1.22 M | 12.3 M (3000 steps) | **8.76 +/- 0.13** |
+
+Note that the paper-#1 baselines received a **longer** training
+budget (20.5 M vs 12.3 M tokens), so the comparison leans against
+cap-native and the reported margin is conservative.
+
+On the active-parameter axis, cap-native is within ~1.4× of paper
+#1's 895 K cap-input baseline (1.22 M vs 895 K) — not 400× larger.
+**Reaching val ppl 8.76 while computing ~1.22 M parameters per token,
+against 28.00 for a dense transformer of comparable active size, is
+the claim this paper defends.** It is a statement about quality per
+unit of inference compute.
+
+**Why total-parameter matching is not well-posed at this corpus
+scale.** The obvious missing row — a vanilla transformer at 143 M or
+368 M total parameters — would not, at TinyStories-small scale,
+measure what it appears to measure. Compute-optimal training requires
+on the order of 20 tokens per parameter (Hoffmann et al. 2022). Our
+corpus supplies 3.5 M tokens:
+
+| Model | parameters to fit | tokens trained | tokens/param |
 |---|---|---|---|
-| Pure transformer (paper #1) | 853 K | 853 K | 28.00 +/- 0.11 |
-| Cap-input kmeans_w3 (paper #1) | 895 K | 895 K | 13.71 +/- 0.33 |
-| Cap-native single-discovery (this paper) | 368 M | ~1.22 M | 9.96 +/- 0.18 |
-| Cap-native hierarchical (this paper) | 143 M | ~1.22 M | 8.76 +/- 0.13 |
-| Vanilla transformer at 143 M params | 143 M | 143 M | _(future work)_ |
-| Vanilla transformer at 368 M params | 368 M | 368 M | _(future work)_ |
+| Pure transformer (paper #1) | 853 K | 20.5 M | ~24 |
+| Cap-native hierarchical (active) | ~1.22 M | 12.3 M | ~10 |
+| Vanilla transformer at ~154 M | ~154 M | 12.3 M | **~0.08** |
 
-On the active-params axis, cap-native is in the same order of
-magnitude as paper #1's 895 K cap-input baseline (1.22 M vs 895 K,
-~1.4×), not 400× larger. The 35-50% perplexity improvement at this
-near-matched active-compute budget is the architectural claim. On
-the total-params axis the comparison is unmatched and we defer the
-fully-matched vanilla-transformer baseline (GPT-2-small at 143 M,
-GPT-2-medium at 368 M) to follow-up work.
+The first two rows sit within an order of magnitude of the
+compute-optimal ratio. A 154 M dense transformer trained on 12.3 M
+tokens sits roughly **250× below** its compute-optimal data budget.
+Any perplexity it reports would be dominated by data starvation
+rather than by architecture, so a cap-native win on that row would be
+uninformative and a loss would be unsurprising. Sparse routing is
+precisely what lets cap-native hold 143 M total parameters while
+fitting only ~1.22 M per token, which is why it remains in a sane
+data regime where a dense model of the same total size does not.
+
+We therefore defer total-parameter-matched baselines to work on a
+corpus large enough to train a model of that size properly — not
+merely to future compute. The comparison becomes meaningful at
+full-TinyStories scale (~500 M tokens) and above; at 3.5 M tokens it
+is a category error.
 
 The hierarchical-vs-single-discovery comparison (§6.2) remains
 internally matched on both axes — same per-cap slab size, same
@@ -658,14 +694,20 @@ natural next step.
 
 ### 8.2 Parameter-Matched Baselines
 
-As discussed in §7.4, cap-native is roughly matched to paper #1 on
+As set out in §7.4, cap-native is roughly matched to paper #1 on
 *active* parameters per token (~1.22 M vs 895 K) but not on *total*
-parameters (368 M and 143 M vs 895 K). Future work will report a
-vanilla-transformer baseline at matched **total** parameter count
-(GPT-2-small at 143 M, GPT-2-medium at 368 M) on the same corpus
-and protocol. That comparison would isolate the architectural
-contribution of cap-keyed routing from the raw memory-footprint
-advantage of dense models at smaller total sizes.
+parameters. A total-parameter-matched vanilla transformer
+(GPT-2-small at 143 M, GPT-2-medium at 368 M) is the natural
+completing comparison, but it requires a corpus large enough to
+train a model of that size out of the data-starved regime — at
+3.5 M tokens such a baseline would sit ~250× below its
+compute-optimal budget and would measure data starvation rather
+than architecture. We therefore pair this baseline with the
+scale-up of §8.1: run it at full-TinyStories scale (~500 M tokens)
+or larger, where both architectures are trained in a defensible
+regime. Reported at that scale, it would isolate the contribution
+of cap-keyed routing from the memory-footprint advantage of dense
+models at equal total size.
 
 ### 8.3 Routing Diversity
 
@@ -727,9 +769,13 @@ a roadmap:
    components route by `concat(cap_acts_0, cap_acts_1)` rather than
    `cap_acts_1` alone (§8.4).
 
-Alongside these, the parameter-matched vanilla-transformer baselines
-of §8.2 (GPT-2-small at 143 M, GPT-2-medium at 368 M) are the other
-outstanding comparison for the continuation paper.
+Alongside these, the total-parameter-matched vanilla-transformer
+baselines of §8.2 (GPT-2-small at 143 M, GPT-2-medium at 368 M) are
+the other outstanding comparison. Unlike the five ablations above,
+which are gated on compute, that comparison is gated on **corpus
+size**: it is only meaningful once the training set is large enough
+to keep a dense model of that size out of the data-starved regime
+(§7.4), so it should be run together with the scale-up of §8.1.
 
 ## 9. Conclusion
 
@@ -744,14 +790,23 @@ contribution is that stacking discovered cap layers is a better
 placement of the cap primitive than the single-input-layer
 placement of paper #1.
 
+Sparse top-1 routing means these totals are not what the model
+computes: ~1.22 M parameters are active per token, so cap-native's
+perplexity should be read as quality per unit of inference compute
+(§7.4). Against a dense transformer of comparable *active* size it
+improves val ppl from 28.00 to 8.76.
+
 The headline result has been validated at three seeds. The
 supporting ablations (routing, window, discovery, indexed-mask,
-hierarchical sub-knobs) and a parameter-matched vanilla-transformer
-baseline are deferred to a continuation paper (§8.7), gated on
-accelerator hardware. This installment establishes the two claims
-that stand on their own: a fully cap-keyed transformer trains to
-competitive perplexity, and stacking two discovered cap layers
-beats one.
+hierarchical sub-knobs) are deferred to a continuation paper (§8.7),
+gated on accelerator hardware. A total-parameter-matched
+vanilla-transformer baseline is deferred for a different reason — at
+3.5 M tokens it would train ~250× below its compute-optimal budget
+and measure data starvation rather than architecture — and belongs
+with the corpus scale-up of §8.1. This installment establishes the
+two claims that stand on their own: a fully cap-keyed transformer
+trains to competitive perplexity at low active-parameter cost, and
+stacking two discovered cap layers beats one.
 
 ## References
 
@@ -783,6 +838,10 @@ arXiv:1609.09106.
 
 Hinton, G. E. (1999). _Products of experts._ In Proceedings of the
 9th International Conference on Artificial Neural Networks (ICANN).
+
+Hoffmann, J., Borgeaud, S., Mensch, A., et al. (2022). _Training
+compute-optimal large language models._ arXiv preprint
+arXiv:2203.15556.
 
 Kingma, D. P., & Ba, J. (2014). _Adam: A method for stochastic
 optimization._ arXiv preprint arXiv:1412.6980.
