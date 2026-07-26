@@ -57,6 +57,26 @@ case "$CONFIG_ID" in
     pure_transformer)
         ARGS=(AWARE_BENCH_ATTENTION=standard AWARE_BENCH_INCLUDE_CAP_LAYER=false)
         ;;
+    # Single-head baseline control (Phase B'): quantifies how much of the
+    # published cap-attention deficit was head count in general rather than
+    # anything about caps. Pre-RoPE-fix this config crashed (d_k mismatch).
+    pure_transformer_1head)
+        ARGS=(AWARE_BENCH_ATTENTION=standard AWARE_BENCH_INCLUDE_CAP_LAYER=false
+              AWARE_BENCH_N_HEADS=1)
+        ;;
+    # Discovery-strategy sweep at the winning window (paper #1 v2 §VI-E).
+    disc_random_w3)
+        ARGS=(AWARE_BENCH_ATTENTION=standard AWARE_BENCH_INCLUDE_CAP_LAYER=true
+              AWARE_BENCH_CAP_DISCOVERY=random AWARE_BENCH_CAP_WINDOW=3)
+        ;;
+    disc_nodiscovery_w3)
+        ARGS=(AWARE_BENCH_ATTENTION=standard AWARE_BENCH_INCLUDE_CAP_LAYER=true
+              AWARE_BENCH_CAP_DISCOVERY=nodiscovery AWARE_BENCH_CAP_WINDOW=3)
+        ;;
+    disc_hybrid_w3)
+        ARGS=(AWARE_BENCH_ATTENTION=standard AWARE_BENCH_INCLUDE_CAP_LAYER=true
+              AWARE_BENCH_CAP_DISCOVERY=hybrid AWARE_BENCH_CAP_WINDOW=3)
+        ;;
     kmeans_w1)
         ARGS=(AWARE_BENCH_ATTENTION=standard AWARE_BENCH_INCLUDE_CAP_LAYER=true
               AWARE_BENCH_CAP_DISCOVERY=kmeans AWARE_BENCH_CAP_WINDOW=1)
