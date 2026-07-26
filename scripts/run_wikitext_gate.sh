@@ -60,6 +60,6 @@ for cfg in ("pure_transformer", "kmeans_w3"):
 if len(rows) == 2:
     base, cap = rows[0][1], rows[1][1]
     print()
-    print(f"  cap-input vs baseline: {100.0*(base-cap)/base:+.1f}% perplexity change")
-    print(f"  (TinyStories reference: -51%)")
+    print(f"  cap-input vs baseline: {100.0*(base-cap)/base:.1f}% perplexity REDUCTION")
+    print(f"  (TinyStories reference: 51.0% reduction)")
 PYEOF
