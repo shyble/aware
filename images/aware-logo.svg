@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 160" width="560" height="160" role="img" aria-label="AWARE">
+  <!-- AWARE: a lattice of anonymous units; one cap carries identity —
+       lit, wearing a lifecycle ring with an ID notch.
+       Colours are set as inline presentation attributes rather than an
+       embedded CSS block, which GitHub strips when rendering SVG in a
+       README. The dark backdrop keeps the wordmark legible in both the
+       light and dark README themes. -->
+  <rect width="560" height="160" rx="16" fill="#0f172a"/>
+
+  <!-- 4 x 3 lattice, 40px pitch -->
+  <g transform="translate(60,20)">
+    <circle cx="0"   cy="0"   r="7" fill="#64748b" opacity="0.45"/>
+    <circle cx="40"  cy="0"   r="7" fill="#64748b" opacity="0.45"/>
+    <circle cx="80"  cy="0"   r="7" fill="#64748b" opacity="0.45"/>
+    <circle cx="120" cy="0"   r="7" fill="#64748b" opacity="0.45"/>
+
+    <circle cx="0"   cy="60"  r="7" fill="#64748b" opacity="0.45"/>
+    <!-- the cap: same size, same lattice — but it has identity -->
+    <circle cx="40"  cy="60"  r="9" fill="#22d3ee"/>
+    <path d="M 40 42 A 18 18 0 1 0 52.7 47.3"
+          fill="none" stroke="#22d3ee" stroke-width="3" stroke-linecap="round"/>
+    <circle cx="80"  cy="60"  r="7" fill="#64748b" opacity="0.45"/>
+    <circle cx="120" cy="60"  r="7" fill="#64748b" opacity="0.45"/>
+
+    <circle cx="0"   cy="120" r="7" fill="#64748b" opacity="0.45"/>
+    <circle cx="40"  cy="120" r="7" fill="#64748b" opacity="0.45"/>
+    <circle cx="80"  cy="120" r="7" fill="#64748b" opacity="0.45"/>
+    <circle cx="120" cy="120" r="7" fill="#64748b" opacity="0.45"/>
+  </g>
+
+  <!-- wordmark: one letter carries the accent, the same one-among-many gesture -->
+  <text x="250" y="103"
+        font-family="Helvetica, Arial, sans-serif" font-weight="700"
+        font-size="64" letter-spacing="6" fill="#e2e8f0">AW<tspan fill="#22d3ee">A</tspan>RE</text>
+</svg>

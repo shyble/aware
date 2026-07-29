@@ -1,6 +1,8 @@
-# AWARE
+<p align="center">
+  <img src="images/aware-logo.svg" alt="AWARE" width="420">
+</p>
 
-**Architectural Primitives for Identifiable, Growable AI**
+<p align="center"><strong>Architectural Primitives for Identifiable, Growable AI</strong></p>
 
 AWARE introduces **caps** (capability nodes): identifiable, lifecycle-
 managed computational units. Each cap carries a stable identifier across
