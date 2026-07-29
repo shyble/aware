@@ -215,7 +215,11 @@ fn main() -> Result<()> {
     println!();
 
     // ── Load BPE (train from a brief corpus pass if missing) ──
-    let bpe = match load_bpe("data/brain_tinystories") {
+    // A tokenizer trained on one corpus fragments another badly, and the
+    // .bin cache is not keyed to the tokenizer - so the BPE directory must
+    // be explicit when the corpus is not TinyStories.
+    let bpe_dir = env_str("AWARE_BENCH_BPE_DIR", "data/brain_tinystories");
+    let bpe = match load_bpe(&bpe_dir) {
         Ok(b) => b,
         Err(_) => {
             let sample = fs::read_to_string(&corpus_path).unwrap_or_else(|e| {
