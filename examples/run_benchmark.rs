@@ -295,7 +295,7 @@ fn main() -> Result<()> {
     };
 
     // ── Build substrate ──
-    let device = Device::Cpu;
+    let device = aware::aware::default_device()?;
     let mut builder = Substrate::builder()
         .with_vocab(bpe.vocab_size())
         .with_d_model(d_model)
