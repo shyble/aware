@@ -64,6 +64,27 @@ case "$CONFIG_ID" in
         ARGS=(AWARE_BENCH_ATTENTION=standard AWARE_BENCH_INCLUDE_CAP_LAYER=false
               AWARE_BENCH_N_HEADS=1)
         ;;
+    # Dense scaling sweep: plain transformers at increasing size, same corpus
+    # and tokenizer, to locate the dense size whose best perplexity matches
+    # cap-native hierarchical (8.76 on TinyStories-small). Trained with a
+    # generous budget (set AWARE_BENCH_STEPS=10000) so the dense side is
+    # flattered and the resulting equivalence is conservative.
+    dense_3m)
+        ARGS=(AWARE_BENCH_D_MODEL=256 AWARE_BENCH_N_BLOCKS=4 AWARE_BENCH_N_HEADS=8
+              AWARE_BENCH_D_FF=1024
+              AWARE_BENCH_ATTENTION=standard AWARE_BENCH_INCLUDE_CAP_LAYER=false)
+        ;;
+    dense_10m)
+        ARGS=(AWARE_BENCH_D_MODEL=384 AWARE_BENCH_N_BLOCKS=6 AWARE_BENCH_N_HEADS=12
+              AWARE_BENCH_D_FF=1536
+              AWARE_BENCH_ATTENTION=standard AWARE_BENCH_INCLUDE_CAP_LAYER=false)
+        ;;
+    dense_30m)
+        ARGS=(AWARE_BENCH_D_MODEL=512 AWARE_BENCH_N_BLOCKS=8 AWARE_BENCH_N_HEADS=16
+              AWARE_BENCH_D_FF=2048
+              AWARE_BENCH_ATTENTION=standard AWARE_BENCH_INCLUDE_CAP_LAYER=false)
+        ;;
+
     # Discovery-strategy sweep at the winning window (paper #1 v2 §VI-E).
     disc_random_w3)
         ARGS=(AWARE_BENCH_ATTENTION=standard AWARE_BENCH_INCLUDE_CAP_LAYER=true
