@@ -1,0 +1,10 @@
+{
+  "variant": "wikitext-103-raw-v1",
+  "train_paragraphs": 87224,
+  "val_paragraphs": 1841,
+  "train_words_approx": 10000026,
+  "val_words_approx": 209339,
+  "train_bytes": 53382557,
+  "val_bytes": 1124356,
+  "max_train_words": 10000000
+}
