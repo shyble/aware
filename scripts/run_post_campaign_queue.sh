@@ -40,4 +40,17 @@ for cfg in dense_3m dense_10m dense_30m; do
         ./scripts/run_multi_seed.sh "$cfg" || echo "[queue] $cfg FAILED" >&2
 done
 
+log "stage C: cap-native single-discovery x 3 seeds @ 5000 steps (WikiText)"
+# Budget-matched to stage A's hier runs -> hier-vs-single comparison on the
+# primary corpus. The 368M config is slow (~19-30h/seed): deliberately LAST
+# so it is a killable tail - the SSCI paper can submit without it and the
+# runs then feed the journal extension.
+cd "$WT"
+AWARE_BENCH_CORPUS="$MAIN/data/wikitext103/wikitext_train.txt" \
+AWARE_BENCH_VAL_CORPUS="$MAIN/data/wikitext103/wikitext_val.txt" \
+AWARE_BENCH_BPE_DIR="$MAIN/data/bpe_wikitext103" \
+AWARE_BENCH_OUTPUT_DIR="$MAIN/data/bench_wikitext_capnative" \
+AWARE_BENCH_STEPS=5000 \
+    ./scripts/run_multi_seed.sh cap_native_sparse_d128 || echo "[queue] stage C FAILED" >&2
+
 log "queue complete"
