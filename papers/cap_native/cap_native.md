@@ -645,6 +645,37 @@ against 28.00 for a dense transformer of comparable active size, is
 the claim this paper defends.** It is a statement about quality per
 unit of inference compute.
 
+**A measured dense bound on WikiText-103.** Since drafting the above we
+evaluated cap-native on WikiText-103 and, on the same corpus and
+tokenizer, trained a dense scaling sweep to see how large a plain
+transformer must be to match it. All dense runs use 10 000 steps,
+roughly twice the cap-native budget, so the comparison favours dense.
+
+| Dense transformer | params | val ppl (3 seeds) |
+|---|---|---|
+| d=256, 4 blocks | 3.28 M | 40.58 +/- 0.16 |
+| d=384, 6 blocks | 10.8 M | 36.11 +/- 0.25 |
+| d=512, 8 blocks | 25.4 M | 33.31 +/- 0.23 |
+| **Cap-native hierarchical** | **143 M total / ~1.22 M active** | **14.51 +/- 0.16** |
+
+A log-log fit gives ppl proportional to N^-0.097, close to the -0.076
+exponent reported for dense language models, so the sweep sits in the
+expected scaling regime. We deliberately do not extrapolate that fit to
+14.51: the crossing would lie several thousand times beyond the largest
+size measured, and an extrapolation of that length carries no
+information. The defensible statement is a bound:
+
+> A dense transformer at 25.4 M parameters — 30x cap-native's total
+> parameter count and roughly 20 000x its active parameters per token —
+> reaches only 33.31, still 2.3x cap-native's 14.51. No dense
+> configuration within the measured range approaches cap-native's
+> quality on this corpus.
+
+This does not license the claim that no dense model could reach it;
+larger models on larger corpora plainly can. It bounds the comparison
+at the scale where we have evidence, which is what the previous draft
+lacked.
+
 **Why total-parameter matching is not well-posed at this corpus
 scale.** The obvious missing row — a vanilla transformer at 143 M or
 368 M total parameters — would not, at TinyStories-small scale,
