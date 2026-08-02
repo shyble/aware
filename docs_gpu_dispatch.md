@@ -34,14 +34,42 @@ code costs nothing, because there is no transfer.
 to every block. So every one of those ~32 routing computations consumes an
 identical input and returns an identical result.
 
+## Measured outcome (Aug 2026, RTX 4060)
+
+Changes 1-2 are implemented and verified.
+
+| config | baseline | with change | |
+|---|---|---|---|
+| single-discovery 368M, 330 caps | 30.4 s/step | **19.6 s/step** | 35% faster |
+| hierarchical 143M, 128 caps | 0.453 s/step | 0.446 s/step | ~unchanged |
+
+Both bit-identical to baseline on the same GPU and seed: single-discovery
+163.69 = 163.69, hierarchical 166.52 = 166.52.
+
+**The saving is routing *construction*, not sync latency.** The first
+prediction here was that GPU->CPU round-trips dominated; that was wrong.
+`bounded_grouped_routing` builds bucket offsets and a `pad_perm` tensor of
+size `n_caps x bound`, so its cost scales with cap count. At 330 caps that
+work is ~2.6x heavier than at 128, and it ran 32 times per forward. Hence
+the large gain on single-discovery and none on hierarchical.
+
+**Still slower than CPU for single-discovery**: 19.6 s/step on the 4060
+versus 15.1 s/step on an M1 Pro. What remains is the dispatch itself -
+gather/scatter plus a padded matmul over 330 buckets - and VRAM pressure
+at ~5.9 GB static on an 8 GB card. Those are changes 3-5 below.
+
+Note the config dependence: hierarchical (143M, 128 caps) runs at
+0.446 s/step on the same GPU, 9x faster than CPU. The problem is specific
+to many caps and a large model on a small card, not to cap-native.
+
 ## Proposed changes, ordered by safety
 
-### 1. Hoist routing to one call per block — SAFE, bit-identical
+### 1. Hoist routing to one call per block — DONE, verified bit-identical
 Compute `bounded_grouped_routing` once per block, thread it to the
 components. Same input tensor, same deterministic `argmax`, same output.
 Cannot change results. Helps CPU too.
 
-### 2. Cache routing across all blocks — SAFE, bit-identical
+### 2. Cache routing across all blocks — DONE, verified bit-identical
 Since `cap_acts` is shared substrate-wide, one routing structure serves
 every block. Reduces ~32 round-trips to 1. Same argument as (1).
 

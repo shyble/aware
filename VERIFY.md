@@ -40,3 +40,19 @@ Compare against 14.58.
 A cheaper smoke check for iteration: 100 steps and compare the step-100
 perplexity, which is deterministic for the same seed and catches gross
 breakage in minutes rather than hours.
+
+## Results (Aug 2026)
+
+Both changes verified on an RTX 4060, comparing branches on the *same*
+device so the code is the only variable:
+
+| config | cap-native | gpu-dispatch | verdict |
+|---|---|---|---|
+| hier, seed 42, step 100 | ppl 166.52 / 45.3s | ppl 166.52 / 44.6s | identical, no speedup |
+| single-disc, seed 42, step 100 | ppl 163.69 / 3038.9s | ppl 163.69 / 1959.4s | identical, 35% faster |
+
+Bit-identical claim: **confirmed** on both configs.
+
+Note the first attempt compared gpu-dispatch-on-GPU against
+cap-native-on-CPU, which changes two variables at once and cannot settle
+the question. Always hold the device fixed.
