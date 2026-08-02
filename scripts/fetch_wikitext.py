@@ -72,10 +72,26 @@ def main():
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
 
+    # The dataset moved to a namespaced repo; newer huggingface_hub rejects
+    # the bare name ("repo id must be namespace/name"), while older datasets
+    # releases only know the canonical alias. Try both.
+    repo_ids = ["Salesforce/wikitext", "wikitext"]
+
+    def open_split(split):
+        last = None
+        for repo in repo_ids:
+            try:
+                return load_dataset(repo, args.variant, split=split, streaming=True)
+            except Exception as e:  # noqa: BLE001 - fall through to the next id
+                last = e
+        raise SystemExit(
+            f"ERROR: could not load {args.variant} from any of {repo_ids}: {last}"
+        )
+
     def pull(split, cap_words):
         """Stream one split, keeping real article text and dropping the
         section headings WikiText marks with '=' rules."""
-        ds = load_dataset("wikitext", args.variant, split=split, streaming=True)
+        ds = open_split(split)
         lines, n_words = [], 0
         for row in ds:
             text = row.get("text", "")
