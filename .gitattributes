@@ -1,0 +1,13 @@
+# Keep line endings identical on every machine.
+#
+# Git's core.autocrlf is commonly enabled on Windows, which rewrites LF to
+# CRLF on checkout. For this repo that is not cosmetic: corpora and
+# tokenizer inputs feed a BPE, so an extra carriage return per line changes
+# the token stream and makes perplexities incomparable across machines.
+* text=auto eol=lf
+
+# Binary artefacts: never translate, never diff as text.
+*.bin  binary
+*.png  binary
+*.jpg  binary
+*.pdf  binary
