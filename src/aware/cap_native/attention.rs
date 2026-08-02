@@ -13,7 +13,7 @@ use candle_nn::{ops, VarMap};
 use super::compression::RoutingMode;
 use super::norm::top_k_softmax;
 use super::sparse_routing::{
-    apply_bounded_grouped_projection, bounded_grouped_routing, BoundedGroupedRouting,
+    apply_bounded_grouped_projection, routing_from_cap_acts, BoundedGroupedRouting,
 };
 use crate::aware::embed::{build_causal_mask, RoPE};
 
@@ -114,6 +114,18 @@ impl CapKeyedMha {
     }
 
     pub fn forward(&self, xs: &Tensor, cap_acts: &Tensor) -> CResult<Tensor> {
+        self.forward_with_routing(xs, cap_acts, None)
+    }
+
+    /// Forward with an optional precomputed routing structure. Passing the
+    /// substrate-level routing avoids re-deriving it here, which would cost
+    /// a device synchronisation per projection.
+    pub fn forward_with_routing(
+        &self,
+        xs: &Tensor,
+        cap_acts: &Tensor,
+        routing_in: Option<&BoundedGroupedRouting>,
+    ) -> CResult<Tensor> {
         let (b, s, dm) = xs.dims3()?;
         if dm != self.d_model {
             return Err(candle_core::Error::Msg(format!(
@@ -162,9 +174,10 @@ impl CapKeyedMha {
                 // Memory stays bounded regardless of cap firing
                 // imbalance; kernel launches drop from O(n_caps) to
                 // O(1)+O(overflow buckets) per cap-keyed component.
-                let winners_t = cap_flat.argmax(D::Minus1)?;
-                let winners: Vec<u32> = winners_t.to_vec1::<u32>()?;
-                let routing = bounded_grouped_routing(&winners, self.n_caps, &self.device)?;
+                let routing = match routing_in {
+                    Some(r) => r.clone(),
+                    None => routing_from_cap_acts(cap_acts, self.n_caps, &self.device)?,
+                };
 
                 let xs_sorted = xs_flat.index_select(&routing.perm_t, 0)?;
                 let qkv_sorted = apply_bounded_grouped_projection(

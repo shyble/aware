@@ -8,6 +8,7 @@ use super::block::{CapNativeBlock, CapNativeBlockConfig};
 use super::compression::RoutingMode;
 use super::config::CapNativeConfig;
 use super::norm::CapKeyedRmsNorm;
+use super::sparse_routing::routing_from_cap_acts;
 use super::output::CapKeyedOutput;
 
 pub struct CapNativeSubstrate {
@@ -55,12 +56,25 @@ impl CapNativeSubstrate {
             }
         };
 
+        // Every cap-keyed projection in the substrate routes by this same
+        // `cap_acts` tensor, so the routing decision is derived once here
+        // and shared. Deriving it per projection returns an identical
+        // structure but costs a device synchronisation each time.
+        let routing = match self.config.routing {
+            RoutingMode::HardTop1Sparse => Some(routing_from_cap_acts(
+                &cap_acts,
+                self.config.downstream_n_caps(),
+                &self.device,
+            )?),
+            RoutingMode::SoftTopK => None,
+        };
+
         let mut h = h;
         for block in &self.blocks {
-            h = block.forward(&h, &cap_acts)?;
+            h = block.forward_with_routing(&h, &cap_acts, routing.as_ref())?;
         }
         let h = self.final_norm.forward(&h, &cap_acts)?;
-        self.output.forward(&h, &cap_acts)
+        self.output.forward_with_routing(&h, &cap_acts, routing.as_ref())
     }
 
     /// Cross-entropy loss for next-token prediction.

@@ -8,7 +8,9 @@ use candle_nn::VarMap;
 
 use super::compression::RoutingMode;
 use super::norm::top_k_softmax;
-use super::sparse_routing::{apply_bounded_grouped_projection, bounded_grouped_routing};
+use super::sparse_routing::{
+    apply_bounded_grouped_projection, routing_from_cap_acts, BoundedGroupedRouting,
+};
 
 pub struct CapKeyedOutput {
     pub n_caps: usize,
@@ -67,8 +69,18 @@ impl CapKeyedOutput {
     }
 
     pub fn forward(&self, h: &Tensor, cap_acts: &Tensor) -> CResult<Tensor> {
+        self.forward_with_routing(h, cap_acts, None)
+    }
+
+    /// See `CapKeyedMha::forward_with_routing`.
+    pub fn forward_with_routing(
+        &self,
+        h: &Tensor,
+        cap_acts: &Tensor,
+        routing_in: Option<&BoundedGroupedRouting>,
+    ) -> CResult<Tensor> {
         match self.routing {
-            RoutingMode::HardTop1Sparse => self.forward_sparse_top1(h, cap_acts),
+            RoutingMode::HardTop1Sparse => self.forward_sparse_top1(h, cap_acts, routing_in),
             RoutingMode::SoftTopK => self.forward_soft_topk(h, cap_acts),
         }
     }
@@ -107,7 +119,12 @@ impl CapKeyedOutput {
         out_flat.reshape(out_dims)
     }
 
-    fn forward_sparse_top1(&self, h: &Tensor, cap_acts: &Tensor) -> CResult<Tensor> {
+    fn forward_sparse_top1(
+        &self,
+        h: &Tensor,
+        cap_acts: &Tensor,
+        routing_in: Option<&BoundedGroupedRouting>,
+    ) -> CResult<Tensor> {
         let h_dims = h.dims();
         let n_dim = h_dims.len();
         let total: usize = h_dims[..n_dim - 1].iter().product();
@@ -119,14 +136,13 @@ impl CapKeyedOutput {
                 "CapKeyedOutput.forward_sparse_top1: token count mismatch".into(),
             ));
         }
-        let cap_flat = cap_acts.reshape((total, self.n_caps))?;
-
         // Bounded grouped dispatch: ONE batched matmul on the fits
         // portion + a per-bucket overflow loop. Memory bounded by
         // n_caps × bound × max(d_model, vocab).
-        let winners_t = cap_flat.argmax(D::Minus1)?;
-        let winners: Vec<u32> = winners_t.to_vec1::<u32>()?;
-        let routing = bounded_grouped_routing(&winners, self.n_caps, &self.device)?;
+        let routing = match routing_in {
+            Some(r) => r.clone(),
+            None => routing_from_cap_acts(cap_acts, self.n_caps, &self.device)?,
+        };
 
         let h_sorted = h_flat.index_select(&routing.perm_t, 0)?;
         let out_sorted =
