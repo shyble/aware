@@ -35,87 +35,87 @@ def save(fig, name):
 # Bar chart 1: window sweep
 # ---------------------------------------------------------------------------
 def fig_window_sweep():
-    # Multi-seed values from paper §6.3 / §6.5
-    # (w=5 is single-seed; baseline pure_transformer is 3-seed)
-    labels = [
-        "pure\ntransformer",
-        "cap\nw=1",
-        "cap\nw=2",
-        "cap\nw=3",
-        "cap\nw=4",
-        "cap\nw=5",
-        "cap\nw=8",
-    ]
-    means = [28.00, 28.77, 13.95, 13.71, 15.32, 18.86, 27.94]
-    stds = [0.11, 0.92, 0.26, 0.33, 0.27, 0.0, 1.46]
-    seeds = ["3", "3", "3", "3", "3", "1", "3"]
+    """Window sweep on both corpora, normalised so the shapes are comparable
+    despite the very different perplexity scales."""
+    windows = [1, 2, 3, 4, 5, 8]
+    ts = dict(means=[28.77, 13.95, 13.71, 15.32, 18.86, 27.94],
+              stds=[0.92, 0.26, 0.33, 0.27, 0.0, 1.46], base=28.12)
+    wt = dict(means=[52.74, 29.31, 30.37, 34.13, 42.60, 71.06],
+              stds=[0.88, 0.50, 0.60, 0.64, 0.70, 2.66], base=51.42)
 
-    # Color scheme: gray for baseline + no-activation, teal for activation regime
-    colors = ["#555555"] + ["#999999"] + ["#2a9d8f"] * 3 + ["#999999"] * 2
-    # darker teal for the winner
-    colors[3] = "#1d6a5e"
+    fig, axes = plt.subplots(1, 2, figsize=(10.0, 4.2))
+    for ax, d, name, colour in (
+        (axes[0], ts, "TinyStories", "#2a9d8f"),
+        (axes[1], wt, "WikiText-103", "#264653"),
+    ):
+        x = np.arange(len(windows))
+        # Grey outside the activation regime, coloured inside it.
+        colours = [colour if w in (2, 3, 4) else "#aaaaaa" for w in windows]
+        ax.bar(x, d["means"], yerr=d["stds"], capsize=3, color=colours,
+               edgecolor="black", linewidth=0.6,
+               error_kw={"ecolor": "black", "lw": 0.9})
+        ax.axhline(y=d["base"], color="black", linestyle="--", linewidth=0.8,
+                   alpha=0.55)
+        ax.text(len(windows) - 0.4, d["base"], " baseline", va="bottom",
+                ha="right", fontsize=8, alpha=0.7)
+        ax.axvspan(0.5, 3.5, alpha=0.08, color=colour)
+        ax.set_xticks(x)
+        ax.set_xticklabels([f"w={w}" for w in windows], fontsize=9)
+        ax.set_title(name, fontsize=11)
+        ax.set_ylim(0, max(d["means"]) * 1.28)
+        ax.grid(axis="y", alpha=0.3, linestyle=":")
+        ax.set_axisbelow(True)
+        best = int(np.argmin(d["means"]))
+        ax.annotate(f"{d['means'][best]:.2f}", xy=(best, d["means"][best]),
+                    xytext=(best, d["means"][best] + max(d["means"]) * 0.13),
+                    ha="center", fontsize=9, fontweight="bold", color=colour,
+                    arrowprops=dict(arrowstyle="->", color=colour, lw=1.1))
 
-    fig, ax = plt.subplots(figsize=(8.5, 5.0))
-    x = np.arange(len(labels))
-    bars = ax.bar(
-        x,
-        means,
-        yerr=stds,
-        capsize=4,
-        color=colors,
-        edgecolor="black",
-        linewidth=0.6,
-        error_kw={"ecolor": "black", "lw": 1},
-    )
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, fontsize=10)
-    ax.set_ylabel("Validation perplexity (lower is better)")
-    ax.set_title(
-        "Cap-input window sweep on TinyStories (~895K params, multi-seed)",
-        fontsize=11,
-    )
-    ax.set_ylim(0, 36)
-    ax.axhline(y=28.00, color="black", linestyle="--", linewidth=0.7, alpha=0.4)
-    ax.grid(axis="y", alpha=0.3, linestyle=":")
-    ax.set_axisbelow(True)
-
-    # Annotate values above each bar
-    for bar, m, s, n in zip(bars, means, stds, seeds):
-        label = f"{m:.2f}" if s == 0 else f"{m:.2f}\n±{s:.2f}"
-        ax.text(
-            bar.get_x() + bar.get_width() / 2,
-            m + s + 0.7,
-            label,
-            ha="center",
-            fontsize=8,
-        )
-
-    # Highlight winner
-    ax.annotate(
-        "51% reduction\nvs baseline",
-        xy=(3, means[3]),
-        xytext=(4.6, 6.5),
-        ha="center",
-        fontsize=10,
-        fontweight="bold",
-        color="#1d6a5e",
-        arrowprops=dict(arrowstyle="->", color="#1d6a5e", lw=1.2),
-    )
-
-    # Activation regime band
-    ax.axvspan(1.5, 4.5, alpha=0.08, color="#2a9d8f")
-    ax.text(
-        3.0,
-        33.5,
-        "activation regime (w ∈ {2, 3, 4})",
-        ha="center",
-        fontsize=9,
-        color="#1d6a5e",
-        style="italic",
-    )
-
+    axes[0].set_ylabel("Validation perplexity (lower is better)")
+    # The one asymmetry worth calling out: w=8 is benign on synthetic text but
+    # actively harmful on real prose.
+    axes[1].annotate("w=8 exceeds\nbaseline by 38%", xy=(5, wt["means"][5]),
+                     xytext=(3.7, wt["means"][5] * 0.93), ha="center",
+                     fontsize=8.5, color="#c1121f",
+                     arrowprops=dict(arrowstyle="->", color="#c1121f", lw=1.0))
+    fig.suptitle("Cap-input window sweep: the activation regime transfers, "
+                 "its optimum shifts inward", fontsize=11.5)
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
     save(fig, "window_sweep.png")
+
+
+def fig_converged_gap():
+    """Extended training on WikiText: the two models diverge rather than
+    converge, so the 5000-step figure is a lower bound."""
+    steps = [5000, 10000, 15000]
+    dense = [52.25, 47.65, 45.65]
+    caps = [29.72, 22.45, 20.26]
+
+    fig, ax = plt.subplots(figsize=(7.2, 4.4))
+    ax.plot(steps, dense, "o-", color="#666666", lw=2, ms=7,
+            label="pure transformer (853K)")
+    ax.plot(steps, caps, "o-", color="#1d6a5e", lw=2, ms=7,
+            label="cap input, w=3 (895K)")
+    for s, d, c in zip(steps, dense, caps):
+        ax.annotate(f"{d:.1f}", (s, d), textcoords="offset points",
+                    xytext=(0, 9), ha="center", fontsize=8.5, color="#666666")
+        ax.annotate(f"{c:.1f}", (s, c), textcoords="offset points",
+                    xytext=(0, -14), ha="center", fontsize=8.5, color="#1d6a5e")
+        ax.vlines(s, c, d, color="#bbbbbb", lw=1, linestyle=":")
+        ax.annotate(f"{100*(d-c)/d:.1f}%", (s, (c + d) / 2),
+                    textcoords="offset points", xytext=(7, 0), ha="left",
+                    fontsize=8.5, style="italic", color="#c1121f")
+
+    ax.set_xlabel("Training steps")
+    ax.set_ylabel("Validation perplexity (lower is better)")
+    ax.set_title("Extended training on WikiText-103 (seed 42): the gap widens",
+                 fontsize=11)
+    ax.set_xticks(steps)
+    ax.set_xlim(3500, 17000)
+    ax.grid(alpha=0.3, linestyle=":")
+    ax.set_axisbelow(True)
+    ax.legend(frameon=False, fontsize=9)
+    save(fig, "converged_gap.png")
 
 
 # ---------------------------------------------------------------------------
@@ -557,6 +557,7 @@ def fig_arch_cap_pair():
 if __name__ == "__main__":
     print(f"Writing figures to {OUTDIR}/")
     fig_window_sweep()
+    fig_converged_gap()
     fig_phase_b()
     fig_arch_cap_input()
     fig_arch_cap_memory()
