@@ -119,10 +119,21 @@ def main():
 
     train_path = out / "wikitext_train.txt"
     val_path = out / "wikitext_val.txt"
+
+    def write_lf(path, text):
+        """Write with explicit LF endings.
+
+        Python's text mode translates "\n" to "\r\n" on Windows, which would
+        put carriage returns into the corpus, change the BPE token stream, and
+        make perplexities from different machines incomparable - while also
+        breaking the committed checksums."""
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+
     # Blank-line separated paragraphs, matching the TinyStories layout so the
     # same benchmark runner consumes either corpus unchanged.
-    train_path.write_text("\n\n".join(train_lines), encoding="utf-8")
-    val_path.write_text("\n\n".join(val_lines), encoding="utf-8")
+    write_lf(train_path, "\n\n".join(train_lines))
+    write_lf(val_path, "\n\n".join(val_lines))
 
     stats = {
         "variant": args.variant,
