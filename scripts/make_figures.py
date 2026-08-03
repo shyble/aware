@@ -44,9 +44,12 @@ def fig_window_sweep():
               stds=[0.88, 0.50, 0.60, 0.64, 0.70, 2.66], base=51.42)
 
     fig, axes = plt.subplots(1, 2, figsize=(10.0, 4.2))
+    # Palette is consistent across every figure in the paper: teal marks the
+    # cap models, grey the baseline or an inert configuration. Corpora are
+    # distinguished by panel, not by colour.
     for ax, d, name, colour in (
-        (axes[0], ts, "TinyStories", "#2a9d8f"),
-        (axes[1], wt, "WikiText-103", "#264653"),
+        (axes[0], ts, "TinyStories", "#1d6a5e"),
+        (axes[1], wt, "WikiText-103", "#1d6a5e"),
     ):
         x = np.arange(len(windows))
         # Grey outside the activation regime, coloured inside it.
@@ -102,9 +105,11 @@ def fig_converged_gap():
         ax.annotate(f"{c:.1f}", (s, c), textcoords="offset points",
                     xytext=(0, -14), ha="center", fontsize=8.5, color="#1d6a5e")
         ax.vlines(s, c, d, color="#bbbbbb", lw=1, linestyle=":")
+        # Teal, not red: these mark the cap models' advantage. Red is reserved
+        # throughout the paper for regressions, as in the w=8 callout above.
         ax.annotate(f"{100*(d-c)/d:.1f}%", (s, (c + d) / 2),
                     textcoords="offset points", xytext=(7, 0), ha="left",
-                    fontsize=8.5, style="italic", color="#c1121f")
+                    fontsize=8.5, style="italic", color="#1d6a5e")
 
     ax.set_xlabel("Training steps")
     ax.set_ylabel("Validation perplexity (lower is better)")
@@ -112,6 +117,9 @@ def fig_converged_gap():
                  fontsize=11)
     ax.set_xticks(steps)
     ax.set_xlim(3500, 17000)
+    # Leave room for the value labels drawn below the lower curve.
+    lo, hi = min(caps), max(dense)
+    ax.set_ylim(lo - 0.10 * (hi - lo), hi + 0.06 * (hi - lo))
     ax.grid(alpha=0.3, linestyle=":")
     ax.set_axisbelow(True)
     ax.legend(frameon=False, fontsize=9)

@@ -50,6 +50,33 @@ use aware::data::bpe::BPETokenizer;
 use candle_core::{Device, Result};
 use candle_nn::Optimizer;
 
+/// Which backend this binary was compiled with. Recorded in every report so
+/// a result can be traced to the machine that produced it: runs are spread
+/// across a CPU laptop and a CUDA box, and perplexity comparisons between
+/// two backends need that split to be visible rather than inferred from
+/// wall-clock times after the fact.
+const BACKEND_FEATURES: &str = if cfg!(feature = "cuda") {
+    "cuda"
+} else if cfg!(feature = "metal") {
+    "metal"
+} else if cfg!(feature = "candle") {
+    "candle-cpu"
+} else {
+    "none"
+};
+
+/// candle is pre-1.0 and changes numerics between releases, so the version
+/// is part of the run's identity.
+const CANDLE_VERSION: &str = "0.10.2";
+
+fn device_label(d: &Device) -> &'static str {
+    match d {
+        Device::Cpu => "cpu",
+        Device::Cuda(_) => "cuda",
+        Device::Metal(_) => "metal",
+    }
+}
+
 fn env_str(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
 }
@@ -437,8 +464,9 @@ fn main() -> Result<()> {
 
     let val_source_str = val_corpus_path.as_deref().unwrap_or("(sliced from train)");
     let report_json = format!(
-        "{{\n  \"run_id\": \"{}\",\n  \"seed\": {},\n  \"train_corpus\": \"{}\",\n  \"val_corpus\": \"{}\",\n  \"attention\": \"{}\",\n  \"cap_source\": \"{}\",\n  \"include_cap_layer\": {},\n  \"discovery\": \"{}\",\n  \"n_caps_target\": {},\n  \"cap_window\": {},\n  \"d_model\": {},\n  \"n_blocks\": {},\n  \"n_heads\": {},\n  \"d_ff\": {},\n  \"steps\": {},\n  \"effective_epochs\": {:.2},\n  \"tokens_trained\": {},\n  \"final_train_loss\": {:.4},\n  \"final_val_loss\": {:.4},\n  \"final_val_perplexity\": {:.2},\n  \"params\": {},\n  \"wall_clock_seconds\": {:.1},\n  \"cap_stats_initial\": {{\"input_layer\": {}, \"shared\": {}}},\n  \"cap_stats_final\":   {{\"input_layer\": {}, \"shared\": {}}},\n  \"trajectory\": [\n{}\n  ]\n}}\n",
+        "{{\n  \"run_id\": \"{}\",\n  \"seed\": {},\n  \"device\": \"{}\",\n  \"backend_features\": \"{}\",\n  \"candle_version\": \"{}\",\n  \"train_corpus\": \"{}\",\n  \"val_corpus\": \"{}\",\n  \"attention\": \"{}\",\n  \"cap_source\": \"{}\",\n  \"include_cap_layer\": {},\n  \"discovery\": \"{}\",\n  \"n_caps_target\": {},\n  \"cap_window\": {},\n  \"d_model\": {},\n  \"n_blocks\": {},\n  \"n_heads\": {},\n  \"d_ff\": {},\n  \"steps\": {},\n  \"effective_epochs\": {:.2},\n  \"tokens_trained\": {},\n  \"final_train_loss\": {:.4},\n  \"final_val_loss\": {:.4},\n  \"final_val_perplexity\": {:.2},\n  \"params\": {},\n  \"wall_clock_seconds\": {:.1},\n  \"cap_stats_initial\": {{\"input_layer\": {}, \"shared\": {}}},\n  \"cap_stats_final\":   {{\"input_layer\": {}, \"shared\": {}}},\n  \"trajectory\": [\n{}\n  ]\n}}\n",
         run_id, seed,
+        device_label(&device), BACKEND_FEATURES, CANDLE_VERSION,
         corpus_path, val_source_str,
         attn_kind_str, cap_source, include_cap_layer,
         discovery_str, n_caps_target, cap_window,
