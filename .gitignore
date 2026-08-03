@@ -29,9 +29,10 @@ training_*.csv
 .vscode/
 .local/
 
-# Manuscripts stay out of the public repo while submissions are under
-# double-anonymous review; back them up privately instead.
+# Manuscripts and paper drafts stay out of the public repo while
+# submissions are under double-anonymous review; back up privately.
 tex/
+papers/
 
 # nohup
 nohup.out
