@@ -167,6 +167,24 @@ impl CapMoeMlp {
         // routing state. Each projection becomes one batched matmul
         // plus a (typically empty) overflow loop, instead of n_caps
         // small matmuls. Memory bounded by n_caps × bound × d.
+        // Opt-in device-routed path: builds dispatch indices with tensor
+        // ops instead of a host round trip, and needs no sort because it
+        // works in original token order. Guarded so the default path and
+        // every published number are untouched.
+        if super::blocksparse::enabled() {
+            let bs = super::blocksparse::blocksparse_routing(cap_acts, self.n_caps, &self.device)?;
+            let gate = super::blocksparse::apply_blocksparse_projection(
+                &h_flat, self.w_gate.as_tensor(), &bs)?;
+            let value = super::blocksparse::apply_blocksparse_projection(
+                &h_flat, self.w_value.as_tensor(), &bs)?;
+            let hidden = silu(&gate)?.mul(&value)?;
+            let out_flat = super::blocksparse::apply_blocksparse_projection(
+                &hidden, self.w_out.as_tensor(), &bs)?;
+            let mut out_dims: Vec<usize> = h_dims[..n_dim - 1].to_vec();
+            out_dims.push(self.d_model);
+            return out_flat.reshape(out_dims);
+        }
+
         let routing = match routing_in {
             Some(r) => r.clone(),
             None => routing_from_cap_acts(cap_acts, self.n_caps, &self.device)?,
