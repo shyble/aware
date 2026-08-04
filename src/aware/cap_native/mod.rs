@@ -1,5 +1,6 @@
 pub mod attention;
 pub mod blocksparse;
+pub mod grouped;
 pub mod block;
 pub mod compression;
 pub mod config;
@@ -12,6 +13,7 @@ pub mod substrate;
 
 pub use attention::CapKeyedMha;
 pub use blocksparse::{apply_blocksparse_projection, blocksparse_routing, BlockSparseRouting};
+pub use grouped::{grouped_matmul, GroupedMatmulCuda};
 pub use block::{CapNativeBlock, CapNativeBlockConfig};
 pub use compression::{AutoInputs, CompressionConfig, CompressionDType, DeviceKind, RoutingMode};
 pub use config::{CapLayer1Config, CapNativeConfig};
