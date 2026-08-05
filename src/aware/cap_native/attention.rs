@@ -12,12 +12,18 @@ use candle_nn::{ops, VarMap};
 
 use super::compression::RoutingMode;
 use super::norm::top_k_softmax;
+use super::sparse_routing::{
+    apply_bounded_grouped_projection, bounded_grouped_routing, BoundedGroupedRouting,
+};
 use crate::aware::embed::{build_causal_mask, RoPE};
 
 /// Per-token routing state, threaded between the QKV and O projections.
 enum GateState {
     Soft(Tensor),
-    Sparse(Vec<Vec<u32>>),
+    /// Bounded grouped routing — one batched matmul on the fits portion
+    /// plus a per-bucket overflow loop for skewed cap distributions.
+    /// Shared between QKV and O projections in the same forward.
+    Sparse(BoundedGroupedRouting),
 }
 
 pub struct CapKeyedMha {
@@ -150,43 +156,49 @@ impl CapKeyedMha {
                 (qkv_flat, GateState::Soft(gate_w_flat))
             }
             RoutingMode::HardTop1Sparse => {
+                // Bounded grouped dispatch: ONE batched matmul covers
+                // the fits portion (n_caps × bound × d), with a
+                // per-bucket overflow loop for skewed distributions.
+                // Memory stays bounded regardless of cap firing
+                // imbalance; kernel launches drop from O(n_caps) to
+                // O(1)+O(overflow buckets) per cap-keyed component.
                 let winners_t = cap_flat.argmax(D::Minus1)?;
                 let winners: Vec<u32> = winners_t.to_vec1::<u32>()?;
-                let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); self.n_caps];
-                for (t, &w) in winners.iter().enumerate() {
-                    let k = (w as usize).min(self.n_caps - 1);
-                    buckets[k].push(t as u32);
-                }
-                let mut qkv_flat = Tensor::zeros((total, qkv_dim), self.dtype, &self.device)?;
-                for k in 0..self.n_caps {
-                    if buckets[k].is_empty() {
-                        continue;
-                    }
-                    let n_k = buckets[k].len();
-                    let idx_t = Tensor::from_vec(buckets[k].clone(), (n_k,), &self.device)?;
-                    let xs_k = xs_flat.index_select(&idx_t, 0)?;
-                    let w_qkv_k = self.w_qkv.as_tensor().narrow(0, k, 1)?.squeeze(0)?;
-                    let qkv_k = xs_k.matmul(&w_qkv_k)?;
-                    qkv_flat = qkv_flat.index_add(&idx_t, &qkv_k, 0)?;
-                }
-                (qkv_flat, GateState::Sparse(buckets))
+                let routing = bounded_grouped_routing(&winners, self.n_caps, &self.device)?;
+
+                let xs_sorted = xs_flat.index_select(&routing.perm_t, 0)?;
+                let qkv_sorted = apply_bounded_grouped_projection(
+                    &xs_sorted,
+                    self.w_qkv.as_tensor(),
+                    &routing,
+                )?;
+                let qkv_flat = qkv_sorted.index_select(&routing.inv_perm_t, 0)?;
+                let _ = total; // suppress unused-warning when total unused below
+                let _ = qkv_dim;
+                (qkv_flat, GateState::Sparse(routing))
             }
         };
         let qkv = qkv_flat.reshape((b, s, qkv_dim))?;
 
-        // Standard attention math.
+        // Standard attention math. narrow() on the last dim returns
+        // non-contiguous views; Metal candle's reshape rejects those
+        // (CPU silently copies). .contiguous() before reshape is
+        // load-bearing on the Metal backend.
         let q = qkv
             .narrow(D::Minus1, 0, dm)?
+            .contiguous()?
             .reshape((b, s, self.n_heads, self.d_head))?
             .transpose(1, 2)?
             .contiguous()?;
         let k_t = qkv
             .narrow(D::Minus1, dm, dm)?
+            .contiguous()?
             .reshape((b, s, self.n_heads, self.d_head))?
             .transpose(1, 2)?
             .contiguous()?;
         let v = qkv
             .narrow(D::Minus1, 2 * dm, dm)?
+            .contiguous()?
             .reshape((b, s, self.n_heads, self.d_head))?
             .transpose(1, 2)?
             .contiguous()?;
@@ -239,20 +251,12 @@ impl CapKeyedMha {
                 }
                 out_accum.ok_or_else(|| candle_core::Error::Msg("zero caps".into()))?
             }
-            GateState::Sparse(buckets) => {
-                let mut out_flat = Tensor::zeros((total, dm), self.dtype, &self.device)?;
-                for k in 0..self.n_caps {
-                    if buckets[k].is_empty() {
-                        continue;
-                    }
-                    let n_k = buckets[k].len();
-                    let idx_t = Tensor::from_vec(buckets[k].clone(), (n_k,), &self.device)?;
-                    let attn_k = attn_flat.index_select(&idx_t, 0)?;
-                    let w_o_k = self.w_o.as_tensor().narrow(0, k, 1)?.squeeze(0)?;
-                    let out_k = attn_k.matmul(&w_o_k)?;
-                    out_flat = out_flat.index_add(&idx_t, &out_k, 0)?;
-                }
-                out_flat
+            GateState::Sparse(routing) => {
+                // Reuse the routing state built for the QKV projection.
+                let attn_sorted = attn_flat.index_select(&routing.perm_t, 0)?;
+                let out_sorted =
+                    apply_bounded_grouped_projection(&attn_sorted, self.w_o.as_tensor(), routing)?;
+                out_sorted.index_select(&routing.inv_perm_t, 0)?
             }
         };
         out_flat.reshape((b, s, dm))

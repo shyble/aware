@@ -22,18 +22,51 @@
 
 use std::env;
 use std::fs;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
 use std::time::Instant;
 
-use aware::aware::cap_native::{CapNativeConfig, CapNativeSubstrate, RoutingMode};
+use aware::aware::cap_native::{CapLayer1Config, CapNativeConfig, CapNativeSubstrate, RoutingMode};
 use aware::aware::config::CapConfig;
 use aware::aware::discover::DiscoveryKind;
 use aware::aware::train::LossKind;
 use aware::aware::train::StreamingFeeder;
 use aware::aware::OptimizerKind;
-use aware::data::bpe::load_bpe;
-use aware::data::bpe::BPETokenizer;
+use aware::data::bpe::{ensure_tokenized, load_bpe, BPETokenizer};
 use candle_core::{Device, Result};
 use candle_nn::Optimizer;
+
+/// Sample a bootstrap set from a tokenized .bin file without loading the
+/// whole corpus into memory. Returns `n_samples * window` u32 tokens (for
+/// window > 1, each sample is a contiguous window; for window == 1, just
+/// random tokens).
+fn sample_bootstrap_from_file(
+    path: &Path,
+    n_samples: usize,
+    window: usize,
+    seed: u64,
+) -> std::io::Result<Vec<u32>> {
+    let mut file = File::open(path)?;
+    let n_tokens = (file.metadata()?.len() as usize) / 4;
+    let max_start = n_tokens.saturating_sub(window.max(1) + 1).max(1);
+    let mut rng = if seed == 0 { 0xC0FFEE_BABE } else { seed };
+    let mut out = Vec::with_capacity(n_samples * window.max(1));
+    let chunk_bytes = window.max(1) * 4;
+    let mut buf = vec![0u8; chunk_bytes];
+    for _ in 0..n_samples {
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let start = ((rng >> 33) as usize) % max_start;
+        file.seek(SeekFrom::Start((start * 4) as u64))?;
+        file.read_exact(&mut buf)?;
+        for chunk in buf.chunks_exact(4) {
+            out.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+    }
+    Ok(out)
+}
 
 fn env_str(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
@@ -66,6 +99,7 @@ fn env_bool(key: &str, default: bool) -> bool {
 fn parse_discovery(s: &str) -> DiscoveryKind {
     match s {
         "kmeans" => DiscoveryKind::KMeans,
+        "kmeans_pp" | "kmeanspp" | "kmeans++" => DiscoveryKind::KMeansPP,
         "random" => DiscoveryKind::Random,
         "hybrid" => DiscoveryKind::Hybrid,
         _ => DiscoveryKind::NoDiscovery,
@@ -134,6 +168,15 @@ fn main() -> Result<()> {
     let routing_str = env_str("AWARE_CN_ROUTING", "soft");
     let routing = parse_routing(&routing_str);
 
+    // Hierarchical (Phase E): two stacked discovered CapLayers.
+    let hierarchical = env_bool("AWARE_CN_HIERARCHICAL", false);
+    let l1_n_caps = env_usize("AWARE_CN_L1_N_CAPS", 128);
+    let l1_budget = env_usize("AWARE_CN_L1_BUDGET", l1_n_caps.max(1) * 2);
+    let l1_window = env_usize("AWARE_CN_L1_WINDOW", 1);
+    let l1_discovery_str = env_str("AWARE_CN_L1_DISCOVERY", "kmeans");
+    let l1_discovery = parse_discovery(&l1_discovery_str);
+    let l1_gradient_train = env_bool("AWARE_CN_L1_GRADIENT_TRAIN", false);
+
     let run_dir = format!("{}/{}", output_dir, run_id);
     fs::create_dir_all(&run_dir).ok();
 
@@ -171,91 +214,77 @@ fn main() -> Result<()> {
     println!(" steps: {} (eval every {})", steps, eval_every);
     println!();
 
-    // ── Load + tokenize corpus ──
+    // ── Load BPE (train from a brief corpus pass if missing) ──
+    // A tokenizer trained on one corpus fragments another badly, and the
+    // .bin cache is not keyed to the tokenizer - so the BPE directory must
+    // be explicit when the corpus is not TinyStories.
+    let bpe_dir = env_str("AWARE_BENCH_BPE_DIR", "data/brain_tinystories");
+    let bpe = match load_bpe(&bpe_dir) {
+        Ok(b) => b,
+        Err(_) => {
+            let sample = fs::read_to_string(&corpus_path).unwrap_or_else(|e| {
+                eprintln!("ERROR: read {}: {}", corpus_path, e);
+                std::process::exit(1)
+            });
+            let trained = BPETokenizer::train(&sample, 256);
+            drop(sample);
+            trained
+        }
+    };
+
+    // ── Tokenize once and cache as .bin (disk-streamed for training) ──
     let read_t = Instant::now();
-    let corpus = fs::read_to_string(&corpus_path).unwrap_or_else(|e| {
-        eprintln!("ERROR: read {}: {}", corpus_path, e);
+    let train_bin = ensure_tokenized(Path::new(&corpus_path), &bpe).unwrap_or_else(|e| {
+        eprintln!("ERROR: tokenize train: {}", e);
         std::process::exit(1)
     });
-
-    let bpe = match load_bpe("data/brain_tinystories") {
-        Ok(b) => b,
-        Err(_) => BPETokenizer::train(&corpus, 256),
-    };
-    let train_all: Vec<u32> = bpe.encode(&corpus).into_iter().map(|t| t as u32).collect();
-    drop(corpus);
-    println!(
-        "[cn-bench] tokenize train: {} tokens in {:.1}s",
-        train_all.len(),
-        read_t.elapsed().as_secs_f64()
-    );
-
-    let (train_tokens, val_tokens) = if let Some(vp) = &val_corpus_path {
-        let vt = Instant::now();
-        let val_corpus = fs::read_to_string(vp).unwrap_or_else(|e| {
-            eprintln!("ERROR: read val {}: {}", vp, e);
+    let val_bin = match val_corpus_path.as_ref() {
+        Some(vp) => ensure_tokenized(Path::new(vp), &bpe).unwrap_or_else(|e| {
+            eprintln!("ERROR: tokenize val: {}", e);
             std::process::exit(1)
-        });
-        let val_toks: Vec<u32> = bpe
-            .encode(&val_corpus)
-            .into_iter()
-            .map(|t| t as u32)
-            .collect();
-        println!(
-            "[cn-bench] tokenize val: {} tokens in {:.1}s (from {})",
-            val_toks.len(),
-            vt.elapsed().as_secs_f64(),
-            vp
-        );
-        (train_all, val_toks)
-    } else {
-        let split = (train_all.len() as f64 * (1.0 - val_ratio)) as usize;
-        let mut all = train_all;
-        let val_toks = all.split_off(split);
-        eprintln!("[cn-bench] WARNING: val sliced from train tail; set AWARE_BENCH_VAL_CORPUS for proper holdout");
-        (all, val_toks)
+        }),
+        None => {
+            eprintln!(
+                "ERROR: AWARE_BENCH_VAL_CORPUS required for disk-streaming mode \
+                 (val_ratio={}; pass an explicit val file)",
+                val_ratio
+            );
+            std::process::exit(1)
+        }
     };
+
+    let n_train_tokens = (fs::metadata(&train_bin).unwrap().len() / 4) as usize;
+    let n_val_tokens = (fs::metadata(&val_bin).unwrap().len() / 4) as usize;
     println!(
-        "[cn-bench] split: train={} val={}",
-        train_tokens.len(),
-        val_tokens.len()
+        "[cn-bench] tokenized in {:.1}s: train={} val={}",
+        read_t.elapsed().as_secs_f64(),
+        n_train_tokens,
+        n_val_tokens
     );
 
     let total_train_tokens = (steps * tokens_per_step) as f64;
-    let effective_epochs = total_train_tokens / train_tokens.len() as f64;
+    let effective_epochs = total_train_tokens / n_train_tokens as f64;
     println!(
         "[cn-bench] will train on {} tokens over {} steps = {:.2} effective epochs",
         total_train_tokens as usize, steps, effective_epochs
     );
 
-    // Bootstrap sample for KMeans cap discovery (windowed when cap_window > 1).
-    let target_samples = 2000usize;
-    let mut bs_rng = seed;
-    let bootstrap_tokens: Vec<u32> = if cap_window > 1 {
-        let n_windows = target_samples;
-        let max_start = train_tokens.len().saturating_sub(cap_window + 1);
-        let mut toks = Vec::with_capacity(n_windows * cap_window);
-        for _ in 0..n_windows {
-            bs_rng = bs_rng
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            let start = ((bs_rng >> 33) as usize) % max_start.max(1);
-            toks.extend_from_slice(&train_tokens[start..start + cap_window]);
-        }
-        toks
-    } else {
-        (0..target_samples.min(train_tokens.len()))
-            .map(|_| {
-                bs_rng = bs_rng
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                train_tokens[((bs_rng >> 33) as usize) % train_tokens.len()]
-            })
-            .collect()
-    };
+    // Bootstrap sample for KMeans cap discovery — sampled directly from
+    // train.bin without holding the corpus in memory.
+    let bootstrap_tokens = sample_bootstrap_from_file(
+        &train_bin,
+        2000,
+        cap_window.max(1),
+        seed,
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("ERROR: bootstrap sample: {}", e);
+        std::process::exit(1)
+    });
 
     // ── Build cap-native substrate ──
-    let device = Device::Cpu;
+    let device = aware::aware::default_device()?;
+    println!(" device: {}", aware::aware::device_label(&device));
     let mut cap_config = CapConfig::default();
     cap_config.discovery = discovery;
     cap_config.n_caps_target = n_caps_target;
@@ -277,6 +306,20 @@ fn main() -> Result<()> {
     config.top_k = top_k;
     config.cap_indexed_mask = cap_indexed_mask;
     config.routing = routing;
+    config.hierarchical = hierarchical;
+    config.cap_layer_1 = CapLayer1Config {
+        n_caps_target: l1_n_caps,
+        n_caps_budget: l1_budget,
+        cap_window: l1_window,
+        discovery: l1_discovery,
+        gradient_train: l1_gradient_train,
+    };
+    if hierarchical {
+        println!(
+            " hierarchical: true (layer 1: n_caps={}, window={}, disc={:?})",
+            l1_n_caps, l1_window, l1_discovery,
+        );
+    }
 
     let model = CapNativeSubstrate::builder()
         .with_config(config.clone())
@@ -292,10 +335,18 @@ fn main() -> Result<()> {
     );
     println!("[cn-bench] config: {}", config.label());
 
-    // ── Feeders + optimizer ──
-    let mut train_feeder =
-        StreamingFeeder::from_tokens(train_tokens, batch_size, seq_len).with_seed(seed);
-    let mut val_feeder = StreamingFeeder::from_tokens(val_tokens, batch_size, seq_len)
+    // ── Feeders (disk-streamed, constant memory) + optimizer ──
+    let mut train_feeder = StreamingFeeder::from_file(&train_bin, batch_size, seq_len)
+        .unwrap_or_else(|e| {
+            eprintln!("ERROR: open train feeder: {}", e);
+            std::process::exit(1)
+        })
+        .with_seed(seed);
+    let mut val_feeder = StreamingFeeder::from_file(&val_bin, batch_size, seq_len)
+        .unwrap_or_else(|e| {
+            eprintln!("ERROR: open val feeder: {}", e);
+            std::process::exit(1)
+        })
         .with_seed(seed.wrapping_add(1));
     let mut opt = {
         let vm = model.varmap.lock().unwrap();
@@ -308,69 +359,153 @@ fn main() -> Result<()> {
     let mut trajectory: Vec<(usize, f32, f32, f64)> = Vec::new();
     let mut last_train_loss = 0.0f32;
     let mut final_val_loss = 0.0f32;
+    // Track best val ppl across the run so the report captures the
+    // true convergence point even when training continues past the
+    // plateau into overfitting.
+    let mut best_val_loss = f32::INFINITY;
+    let mut best_val_step: usize = 0;
+
+    let trace_every_step = std::env::var("AWARE_TRACE_STEPS").ok().as_deref() == Some("1");
+    // Write report.json every N eval points so long runs survive
+    // mid-run kills. Default 5 evals (e.g. 500 steps at eval_every=100).
+    let checkpoint_every_evals = env_usize("AWARE_BENCH_CHECKPOINT_EVERY_EVALS", 5);
+    let mut evals_since_checkpoint = 0usize;
+
+    let report_path = format!("{}/report.json", run_dir);
+    let val_source_str_owned = val_corpus_path
+        .as_deref()
+        .unwrap_or("(sliced from train)")
+        .to_string();
+    let routing_label_owned = format!("{:?}", routing);
+
+    let write_report = |trajectory: &Vec<(usize, f32, f32, f64)>,
+                        last_train_loss: f32,
+                        final_val_loss: f32,
+                        best_val_loss: f32,
+                        best_val_step: usize,
+                        total_seconds: f64,
+                        completed: bool|
+     -> Result<()> {
+        let trajectory_json: Vec<String> = trajectory.iter().map(|(s, tr, va, el)| {
+            format!(
+                " {{\"step\":{},\"train_loss\":{:.4},\"val_loss\":{:.4},\"val_perplexity\":{:.2},\"elapsed_s\":{:.1}}}",
+                s, tr, va, (*va as f64).exp(), el,
+            )
+        }).collect();
+        let trajectory_block = trajectory_json.join(",\n");
+        let best_val_ppl_str = if best_val_loss.is_finite() {
+            format!("{:.2}", (best_val_loss as f64).exp())
+        } else {
+            "null".to_string()
+        };
+        let final_val_ppl_str = if final_val_loss.is_finite() && final_val_loss > 0.0 {
+            format!("{:.2}", (final_val_loss as f64).exp())
+        } else {
+            "null".to_string()
+        };
+        let report_json = format!(
+            "{{\n \"run_id\": \"{}\",\n \"architecture\": \"cap_native\",\n \"completed\": {},\n \"seed\": {},\n \"train_corpus\": \"{}\",\n \"val_corpus\": \"{}\",\n \"d_model\": {},\n \"n_blocks\": {},\n \"n_heads\": {},\n \"d_ff\": {},\n \"cap_discovery\": \"{}\",\n \"n_caps_target\": {},\n \"cap_window\": {},\n \"top_k\": {},\n \"cap_indexed_mask\": {},\n \"routing\": \"{}\",\n \"steps\": {},\n \"effective_epochs\": {:.2},\n \"tokens_trained\": {},\n \"final_train_loss\": {:.4},\n \"final_val_loss\": {:.4},\n \"final_val_perplexity\": {},\n \"best_val_loss\": {:.4},\n \"best_val_perplexity\": {},\n \"best_val_step\": {},\n \"params\": {},\n \"wall_clock_seconds\": {:.1},\n \"trajectory\": [\n{}\n ]\n}}\n",
+            run_id, completed, seed,
+            corpus_path, val_source_str_owned,
+            d_model, n_blocks, n_heads, d_ff,
+            discovery_str, n_caps_target, cap_window,
+            top_k, cap_indexed_mask, routing_label_owned,
+            steps, effective_epochs, total_train_tokens as usize,
+            last_train_loss, final_val_loss, final_val_ppl_str,
+            best_val_loss, best_val_ppl_str, best_val_step,
+            n_params, total_seconds,
+            trajectory_block,
+        );
+        fs::write(&report_path, report_json)
+            .map_err(|e| candle_core::Error::Msg(format!("write report: {}", e)))?;
+        Ok(())
+    };
 
     for step in 1..=steps {
+        let step_start = Instant::now();
+        if trace_every_step {
+            print!("[trace] step={} batch…", step);
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+        }
         let (inp, tgt) = train_feeder.next_batch(&device)?;
+        if trace_every_step {
+            print!(" fwd…");
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+        }
         let logits = model.forward(&inp)?;
         let (b, t, v) = logits.dims3()?;
         let logits_flat = logits.reshape((b * t, v))?;
         let tgt_flat = tgt.reshape((b * t,))?;
         let loss = loss_kind.compute(&logits_flat, &tgt_flat)?;
+        if trace_every_step {
+            print!(" bwd…");
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+        }
         opt.backward_step(&loss)?;
         last_train_loss = loss.to_scalar::<f32>()?;
+        if trace_every_step {
+            println!(
+                " done loss={:.3} [{:.2}s]",
+                last_train_loss,
+                step_start.elapsed().as_secs_f64()
+            );
+        }
 
         if step % eval_every == 0 || step == steps {
             let val_loss = compute_val_loss(&model, &mut val_feeder, &device, n_eval_batches)?;
             final_val_loss = val_loss;
+            if val_loss < best_val_loss {
+                best_val_loss = val_loss;
+                best_val_step = step;
+            }
             let elapsed = start.elapsed().as_secs_f64();
             println!(
-                " step={:>5} train={:.3} (ppl={:.1}) val={:.3} (ppl={:.1}) [{:.1}s]",
+                " step={:>5} train={:.3} (ppl={:.1}) val={:.3} (ppl={:.1}) best={:.1}@{} [{:.1}s]",
                 step,
                 last_train_loss,
                 (last_train_loss as f64).exp(),
                 val_loss,
                 (val_loss as f64).exp(),
+                (best_val_loss as f64).exp(),
+                best_val_step,
                 elapsed,
             );
             trajectory.push((step, last_train_loss, val_loss, elapsed));
+            evals_since_checkpoint += 1;
+            if evals_since_checkpoint >= checkpoint_every_evals {
+                write_report(
+                    &trajectory,
+                    last_train_loss,
+                    final_val_loss,
+                    best_val_loss,
+                    best_val_step,
+                    elapsed,
+                    false,
+                )?;
+                println!("[cn-bench] checkpoint: {}", report_path);
+                evals_since_checkpoint = 0;
+            }
         }
     }
 
     let total_seconds = start.elapsed().as_secs_f64();
     println!(
-        "[cn-bench] done. final val_ppl = {:.2}, time = {:.1}s",
+        "[cn-bench] done. final val_ppl = {:.2}, best val_ppl = {:.2} @ step {}, time = {:.1}s",
         (final_val_loss as f64).exp(),
+        (best_val_loss as f64).exp(),
+        best_val_step,
         total_seconds
     );
 
-    // ── Write report.json ──
-    let trajectory_json: Vec<String> = trajectory.iter().map(|(s, tr, va, el)| {
- format!(
- " {{\"step\":{},\"train_loss\":{:.4},\"val_loss\":{:.4},\"val_perplexity\":{:.2},\"elapsed_s\":{:.1}}}",
- s, tr, va, (*va as f64).exp(), el,
- )
- }).collect();
-    let trajectory_block = trajectory_json.join(",\n");
-
-    let val_source_str = val_corpus_path.as_deref().unwrap_or("(sliced from train)");
-    let routing_label = format!("{:?}", routing);
-
-    let report_json = format!(
- "{{\n \"run_id\": \"{}\",\n \"architecture\": \"cap_native\",\n \"seed\": {},\n \"train_corpus\": \"{}\",\n \"val_corpus\": \"{}\",\n \"d_model\": {},\n \"n_blocks\": {},\n \"n_heads\": {},\n \"d_ff\": {},\n \"cap_discovery\": \"{}\",\n \"n_caps_target\": {},\n \"cap_window\": {},\n \"top_k\": {},\n \"cap_indexed_mask\": {},\n \"routing\": \"{}\",\n \"steps\": {},\n \"effective_epochs\": {:.2},\n \"tokens_trained\": {},\n \"final_train_loss\": {:.4},\n \"final_val_loss\": {:.4},\n \"final_val_perplexity\": {:.2},\n \"params\": {},\n \"wall_clock_seconds\": {:.1},\n \"trajectory\": [\n{}\n ]\n}}\n",
- run_id, seed,
- corpus_path, val_source_str,
- d_model, n_blocks, n_heads, d_ff,
- discovery_str, n_caps_target, cap_window,
- top_k, cap_indexed_mask, routing_label,
- steps, effective_epochs, total_train_tokens as usize,
- last_train_loss, final_val_loss, (final_val_loss as f64).exp(),
- n_params, total_seconds,
- trajectory_block,
- );
-
-    let report_path = format!("{}/report.json", run_dir);
-    fs::write(&report_path, report_json)
-        .map_err(|e| candle_core::Error::Msg(format!("write report: {}", e)))?;
+    write_report(
+        &trajectory,
+        last_train_loss,
+        final_val_loss,
+        best_val_loss,
+        best_val_step,
+        total_seconds,
+        true,
+    )?;
     println!("[cn-bench] report: {}", report_path);
     Ok(())
 }

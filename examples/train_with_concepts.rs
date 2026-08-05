@@ -31,14 +31,45 @@
 
 use std::env;
 use std::fs;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use aware::aware::{
     AttentionKind, BlockBuilder, CapConfig, ConceptConfig, DiscoveryKind, LossKind, OptimizerKind,
     StreamingFeeder, Substrate,
 };
-use aware::data::bpe::load_bpe;
-use aware::data::bpe::BPETokenizer;
+use aware::data::bpe::{ensure_tokenized, load_bpe, BPETokenizer};
+
+/// Sample a bootstrap set from a tokenized .bin file without loading the
+/// whole corpus into memory.
+fn sample_bootstrap_from_file(
+    path: &Path,
+    n_samples: usize,
+    window: usize,
+    seed: u64,
+) -> std::io::Result<Vec<u32>> {
+    let mut file = File::open(path)?;
+    let n_tokens = (file.metadata()?.len() as usize) / 4;
+    let max_start = n_tokens.saturating_sub(window.max(1) + 1).max(1);
+    let mut rng = if seed == 0 { 0xC0FFEE_BABE } else { seed };
+    let mut out = Vec::with_capacity(n_samples * window.max(1));
+    let chunk_bytes = window.max(1) * 4;
+    let mut buf = vec![0u8; chunk_bytes];
+    for _ in 0..n_samples {
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let start = ((rng >> 33) as usize) % max_start;
+        file.seek(SeekFrom::Start((start * 4) as u64))?;
+        file.read_exact(&mut buf)?;
+        for chunk in buf.chunks_exact(4) {
+            out.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+    }
+    Ok(out)
+}
 use candle_core::{Device, Result};
 use candle_nn::Optimizer;
 
@@ -102,62 +133,82 @@ fn main() -> Result<()> {
     );
     println!();
 
-    // Load corpus
-    let mut corpus = String::new();
-    for p in &paths {
-        corpus.push_str(&fs::read_to_string(p).unwrap_or_else(|e| {
-            eprintln!("ERROR: read {}: {}", p, e);
-            std::process::exit(1)
-        }));
-        corpus.push('\n');
-    }
+    // ── Load BPE (train from a brief corpus pass if missing) ──
     let bpe = match load_bpe("data/brain_tinystories") {
         Ok(b) => b,
-        Err(_) => BPETokenizer::train(&corpus, 256),
+        Err(_) => {
+            let mut sample = String::new();
+            for p in &paths {
+                sample.push_str(&fs::read_to_string(p).unwrap_or_else(|e| {
+                    eprintln!("ERROR: read {}: {}", p, e);
+                    std::process::exit(1)
+                }));
+                sample.push('\n');
+            }
+            let trained = BPETokenizer::train(&sample, 256);
+            drop(sample);
+            trained
+        }
     };
-    let train_tokens: Vec<u32> = bpe.encode(&corpus).into_iter().map(|t| t as u32).collect();
-    drop(corpus);
 
-    // Val tokens (separate file matching _val convention)
-    let val_path = paths[0].replace("_train", "_val");
-    let val_tokens: Vec<u32> = if std::path::Path::new(&val_path).exists() {
-        let val_corpus = fs::read_to_string(&val_path).expect("read val");
-        bpe.encode(&val_corpus)
-            .into_iter()
-            .map(|t| t as u32)
-            .collect()
+    // ── Tokenize each input path to .bin (disk-streamed for training) ──
+    // Multi-file input: we tokenize each separately and use the first as the
+    // canonical train.bin. Multi-corpus streaming would require concatenation
+    // at the file level; for now we just train on the first corpus and warn
+    // if multiple were passed.
+    if paths.len() > 1 {
+        eprintln!(
+            "WARN: multi-corpus input not supported in disk-streaming mode; \
+             only the first corpus will be used"
+        );
+    }
+    let train_path: PathBuf = PathBuf::from(&paths[0]);
+    let train_bin = ensure_tokenized(&train_path, &bpe).unwrap_or_else(|e| {
+        eprintln!("ERROR: tokenize train: {}", e);
+        std::process::exit(1)
+    });
+
+    // Val: matching _val convention next to the train file.
+    let val_path_str = paths[0].replace("_train", "_val");
+    let val_path = PathBuf::from(&val_path_str);
+    let val_bin = if val_path.exists() {
+        ensure_tokenized(&val_path, &bpe).unwrap_or_else(|e| {
+            eprintln!("ERROR: tokenize val: {}", e);
+            std::process::exit(1)
+        })
     } else {
         eprintln!(
-            "WARN: no val file at {}; slicing last 5% of train",
-            val_path
+            "ERROR: no val file at {} (disk-streaming requires explicit val)",
+            val_path_str
         );
-        let split = (train_tokens.len() as f64 * 0.95) as usize;
-        train_tokens[split..].to_vec()
+        std::process::exit(1)
     };
 
+    let n_train_tokens = (fs::metadata(&train_bin).unwrap().len() / 4) as usize;
+    let n_val_tokens = (fs::metadata(&val_bin).unwrap().len() / 4) as usize;
     println!(
         "[concepts] train tokens: {}, val tokens: {}, vocab: {}",
-        train_tokens.len(),
-        val_tokens.len(),
+        n_train_tokens,
+        n_val_tokens,
         bpe.vocab_size()
     );
 
-    // Bootstrap sample for KMeans (window=4 for cap layer, window=1 for concept)
+    // Bootstrap sample for KMeans (cap_window=4 here; concept layer is
+    // window=1 and uses the same bootstrap tokens).
     let cap_window = 4;
-    let n_windows = 2000usize;
-    let max_start = train_tokens.len().saturating_sub(cap_window + 1);
-    let mut bs_rng = seed;
-    let bootstrap_tokens: Vec<u32> = (0..n_windows)
-        .flat_map(|_| {
-            bs_rng = bs_rng
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            let start = ((bs_rng >> 33) as usize) % max_start.max(1);
-            train_tokens[start..start + cap_window].to_vec()
-        })
-        .collect();
+    let bootstrap_tokens = sample_bootstrap_from_file(
+        &train_bin,
+        2000,
+        cap_window,
+        seed,
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("ERROR: bootstrap sample: {}", e);
+        std::process::exit(1)
+    });
 
-    let device = Device::Cpu;
+    let device = aware::aware::default_device()?;
+    println!("  device: {}", aware::aware::device_label(&device));
     let model = Substrate::builder()
         .with_vocab(bpe.vocab_size())
         .with_d_model(128)
@@ -213,8 +264,17 @@ fn main() -> Result<()> {
 
     // Training loop
     let mut train_feeder =
-        StreamingFeeder::from_tokens(train_tokens, batch_size, seq_len).with_seed(seed);
-    let mut val_feeder = StreamingFeeder::from_tokens(val_tokens, batch_size, seq_len)
+        StreamingFeeder::from_file(&train_bin, batch_size, seq_len)
+            .unwrap_or_else(|e| {
+                eprintln!("ERROR: open train feeder: {}", e);
+                std::process::exit(1)
+            })
+            .with_seed(seed);
+    let mut val_feeder = StreamingFeeder::from_file(&val_bin, batch_size, seq_len)
+        .unwrap_or_else(|e| {
+            eprintln!("ERROR: open val feeder: {}", e);
+            std::process::exit(1)
+        })
         .with_seed(seed.wrapping_add(1));
 
     let mut opt = OptimizerKind::AdamW { lr }.build(&model.varmap)?;

@@ -9,6 +9,7 @@ use candle_nn::VarMap;
 
 use super::compression::RoutingMode;
 use super::norm::top_k_softmax;
+use super::sparse_routing::{apply_bounded_grouped_projection, bounded_grouped_routing};
 
 pub struct CapMoeMlp {
     pub n_caps: usize,
@@ -146,31 +147,25 @@ impl CapMoeMlp {
             ));
         }
         let cap_flat = cap_acts.reshape((total, self.n_caps))?;
+
+        // Bounded grouped dispatch: three SwiGLU projections share one
+        // routing state. Each projection becomes one batched matmul
+        // plus a (typically empty) overflow loop, instead of n_caps
+        // small matmuls. Memory bounded by n_caps × bound × d.
         let winners_t = cap_flat.argmax(D::Minus1)?;
         let winners: Vec<u32> = winners_t.to_vec1::<u32>()?;
-        let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); self.n_caps];
-        for (t, &w) in winners.iter().enumerate() {
-            let k = (w as usize).min(self.n_caps - 1);
-            buckets[k].push(t as u32);
-        }
-        let mut out_flat = Tensor::zeros((total, self.d_model), self.dtype, &self.device)?;
-        for k in 0..self.n_caps {
-            if buckets[k].is_empty() {
-                continue;
-            }
-            let n_k = buckets[k].len();
-            let idx_t = Tensor::from_vec(buckets[k].clone(), (n_k,), &self.device)?;
-            let h_k = h_flat.index_select(&idx_t, 0)?;
-            let w_g_k = self.w_gate.as_tensor().narrow(0, k, 1)?.squeeze(0)?;
-            let w_v_k = self.w_value.as_tensor().narrow(0, k, 1)?.squeeze(0)?;
-            let w_o_k = self.w_out.as_tensor().narrow(0, k, 1)?.squeeze(0)?;
-            let gate = h_k.matmul(&w_g_k)?;
-            let gate_act = silu(&gate)?;
-            let val = h_k.matmul(&w_v_k)?;
-            let hidden = gate_act.mul(&val)?;
-            let expert_out = hidden.matmul(&w_o_k)?;
-            out_flat = out_flat.index_add(&idx_t, &expert_out, 0)?;
-        }
+        let routing = bounded_grouped_routing(&winners, self.n_caps, &self.device)?;
+
+        let h_sorted = h_flat.index_select(&routing.perm_t, 0)?;
+        let gate_sorted =
+            apply_bounded_grouped_projection(&h_sorted, self.w_gate.as_tensor(), &routing)?;
+        let value_sorted =
+            apply_bounded_grouped_projection(&h_sorted, self.w_value.as_tensor(), &routing)?;
+        let hidden_sorted = silu(&gate_sorted)?.mul(&value_sorted)?;
+        let out_sorted =
+            apply_bounded_grouped_projection(&hidden_sorted, self.w_out.as_tensor(), &routing)?;
+        let out_flat = out_sorted.index_select(&routing.inv_perm_t, 0)?;
+
         let mut out_dims: Vec<usize> = h_dims[..n_dim - 1].to_vec();
         out_dims.push(self.d_model);
         out_flat.reshape(out_dims)

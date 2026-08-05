@@ -8,6 +8,7 @@ use candle_nn::VarMap;
 
 use super::compression::RoutingMode;
 use super::norm::top_k_softmax;
+use super::sparse_routing::{apply_bounded_grouped_projection, bounded_grouped_routing};
 
 pub struct CapKeyedOutput {
     pub n_caps: usize,
@@ -114,32 +115,23 @@ impl CapKeyedOutput {
         let cap_dims = cap_acts.dims();
         let cap_total: usize = cap_dims[..cap_dims.len() - 1].iter().product();
         if cap_total != total {
-            return Err(candle_core::Error::Msg(format!(
-                "CapKeyedOutput.forward_sparse_top1: token count mismatch"
-            )));
+            return Err(candle_core::Error::Msg(
+                "CapKeyedOutput.forward_sparse_top1: token count mismatch".into(),
+            ));
         }
         let cap_flat = cap_acts.reshape((total, self.n_caps))?;
 
+        // Bounded grouped dispatch: ONE batched matmul on the fits
+        // portion + a per-bucket overflow loop. Memory bounded by
+        // n_caps × bound × max(d_model, vocab).
         let winners_t = cap_flat.argmax(D::Minus1)?;
         let winners: Vec<u32> = winners_t.to_vec1::<u32>()?;
-        let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); self.n_caps];
-        for (t, &w) in winners.iter().enumerate() {
-            let k = (w as usize).min(self.n_caps - 1);
-            buckets[k].push(t as u32);
-        }
+        let routing = bounded_grouped_routing(&winners, self.n_caps, &self.device)?;
 
-        let mut out_flat = Tensor::zeros((total, self.vocab), self.dtype, &self.device)?;
-        for k in 0..self.n_caps {
-            if buckets[k].is_empty() {
-                continue;
-            }
-            let n_k = buckets[k].len();
-            let idx_t = Tensor::from_vec(buckets[k].clone(), (n_k,), &self.device)?;
-            let h_k = h_flat.index_select(&idx_t, 0)?;
-            let w_k = self.w.as_tensor().narrow(0, k, 1)?.squeeze(0)?;
-            let logits_k = h_k.matmul(&w_k)?;
-            out_flat = out_flat.index_add(&idx_t, &logits_k, 0)?;
-        }
+        let h_sorted = h_flat.index_select(&routing.perm_t, 0)?;
+        let out_sorted =
+            apply_bounded_grouped_projection(&h_sorted, self.w.as_tensor(), &routing)?;
+        let out_flat = out_sorted.index_select(&routing.inv_perm_t, 0)?;
 
         let mut out_dims: Vec<usize> = h_dims[..n_dim - 1].to_vec();
         out_dims.push(self.vocab);

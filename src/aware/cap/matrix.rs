@@ -150,8 +150,23 @@ impl CapMatrix {
     /// Fire on input via dot product. input: [..., d_in].
     /// Returns activations of shape [..., n_caps].
     pub fn fire(&self, input: &Tensor) -> Result<Tensor> {
-        // input @ keys.T -> [..., n_caps]
+        // Flatten leading dims to a single batch axis so the matmul is
+        // strictly 2-D. broadcast_matmul on Metal candle hits shape
+        // edge cases at our scale (e.g. it sees (1, B, B*T) instead of
+        // (B, T, d_in)) and errors out; a contiguous reshape + 2-D
+        // matmul sidesteps that path entirely.
+        let dims = input.dims();
+        let n_dim = dims.len();
+        let d_in = dims[n_dim - 1];
+        let leading: Vec<usize> = dims[..n_dim - 1].to_vec();
+        let total: usize = leading.iter().product();
+        let n_caps = self.keys.dims()[0];
+
+        let input_flat = input.reshape((total, d_in))?.contiguous()?;
         let keys_t = self.keys.transpose(0, 1)?.contiguous()?;
-        input.broadcast_matmul(&keys_t)
+        let acts_flat = input_flat.matmul(&keys_t)?;
+        let mut out_dims = leading;
+        out_dims.push(n_caps);
+        acts_flat.reshape(out_dims)
     }
 }

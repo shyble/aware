@@ -18,7 +18,11 @@ use candle_core::{Device, Result, Tensor};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DiscoveryKind {
     /// k-means cluster centroids over bootstrap data; audit replaces dead.
+    /// Initialization: random sample rows.
     KMeans,
+    /// k-means with k-means++ seeding: more stable across seeds, fewer
+    /// dead clusters, lower run-to-run variance. Same audit as KMeans.
+    KMeansPP,
     /// Random unit vectors; no audit.
     Random,
     /// Xavier random init; gradient does all the work; no audit.
@@ -66,6 +70,7 @@ pub trait Discovery: Send + Sync {
 pub fn make_discovery(kind: DiscoveryKind) -> Box<dyn Discovery> {
     match kind {
         DiscoveryKind::KMeans => Box::new(kmeans::KMeansDiscovery::default()),
+        DiscoveryKind::KMeansPP => Box::new(kmeans::KMeansDiscovery::kmeans_pp()),
         DiscoveryKind::Random => Box::new(random_init::RandomDiscovery::default()),
         DiscoveryKind::NoDiscovery => Box::new(no_discovery::NoDiscovery::default()),
         DiscoveryKind::Hybrid => Box::new(kmeans::KMeansDiscovery::hybrid()),
