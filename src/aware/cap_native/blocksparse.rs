@@ -112,6 +112,39 @@ pub fn enabled() -> bool {
 /// which decides how many passes are required. That is unavoidable
 /// without device-side control flow, and it is four bytes rather than the
 /// `total + n_caps * bound` indices the CPU path moves.
+/// Largest pass count worth attempting before conceding to the
+/// host-routed path.
+///
+/// Every pass allocates a padded `[n_caps, capacity, d]` block and each
+/// one stays live in the autograd graph until backward, so cost grows
+/// linearly in passes and is multiplied by three projections and every
+/// block in the stack. A skewed cap distribution — one cap claiming
+/// hundreds of tokens while most claim a handful — drives the count high
+/// enough to exhaust an 8 GB card. The bounded+overflow path in
+/// `sparse_routing` tolerates skew by design, so hand back to it rather
+/// than trying to absorb it here.
+fn max_passes() -> usize {
+    std::env::var("AWARE_CN_BS_MAX_PASSES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4)
+}
+
+/// Build the plan, or `None` when the cap distribution is too skewed for
+/// this dispatch shape to be worth it. `None` is not an error: it means
+/// "use the host-routed path", which is always correct.
+pub fn try_blocksparse_routing(
+    cap_acts: &Tensor,
+    n_caps: usize,
+    device: &Device,
+) -> Result<Option<BlockSparseRouting>> {
+    let routing = blocksparse_routing(cap_acts, n_caps, device)?;
+    if routing.n_passes > max_passes() {
+        return Ok(None);
+    }
+    Ok(Some(routing))
+}
+
 pub fn blocksparse_routing(
     cap_acts: &Tensor,
     n_caps: usize,

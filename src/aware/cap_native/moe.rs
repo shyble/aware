@@ -171,8 +171,10 @@ impl CapMoeMlp {
         // ops instead of a host round trip, and needs no sort because it
         // works in original token order. Guarded so the default path and
         // every published number are untouched.
-        if super::blocksparse::enabled() {
-            let bs = super::blocksparse::blocksparse_routing(cap_acts, self.n_caps, &self.device)?;
+        if let (true, Some(bs)) = (
+            super::blocksparse::enabled(),
+            super::blocksparse::try_blocksparse_routing(cap_acts, self.n_caps, &self.device)?,
+        ) {
             let gate = super::blocksparse::apply_blocksparse_projection(
                 &h_flat, self.w_gate.as_tensor(), &bs)?;
             let value = super::blocksparse::apply_blocksparse_projection(
