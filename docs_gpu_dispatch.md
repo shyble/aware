@@ -4,7 +4,7 @@ Design note, Aug 2026. Written after measuring the 368M single-discovery
 config at **30.4 s/step on an RTX 4060** versus **15.1 s/step on an M1 Pro
 CPU** — the GPU was twice as slow.
 
-That measurement is not in either paper, deliberately: it describes our
+That measurement is deliberately not reported anywhere: it describes our
 reference implementation on one memory-constrained card with an
 unoptimised backend, not a property of the architecture. MoE systems
 (Switch Transformer, Megablocks) run sparse routing on accelerators
@@ -113,11 +113,11 @@ instead.
 
 Do not do this while experiments are running. Modifying the dispatch path
 mid-campaign makes it impossible to tell whether a seed differed because of
-the seed or the code. Land both papers first.
+the seed or the code. Finish any in-flight campaign first.
 
-## Where this belongs in the papers
+## How to describe this
 
-Not as a result. As a future-work sentence in paper #2:
+Not as a result. As a future-work note:
 
 > The reference implementation dispatches per-cap projections through
 > grouped matmuls with a per-bucket overflow path, which is not competitive

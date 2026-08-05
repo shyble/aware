@@ -11,8 +11,6 @@ replacement, growth), and exposes its learned content for inspection.
 The cap primitive is general; the current implementation integrates it
 into transformer-style language models.
 
-The paper introducing caps: [`papers/caps_primitive/caps_primitive.md`](papers/caps_primitive/caps_primitive.md).
-
 Headline result: cap-input projection with 3-token windows achieves
 **val perplexity 13.71 ± 0.33** on TinyStories, a **51% perplexity
 reduction** over a same-scale pure-transformer baseline (28.00 ± 0.11),

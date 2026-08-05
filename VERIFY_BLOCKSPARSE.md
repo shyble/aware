@@ -90,7 +90,7 @@ Reference points on the RTX 4060:
 
 ## Do not merge before
 
-The SSCI submission (10 Aug 2026). Nothing in paper 2 depends on this, the
-headline architecture is hierarchical (which barely benefits), and
-changing the dispatch path mid-campaign makes a seed difference
-impossible to attribute.
+Any reported result depends on it. Nothing currently reported uses this
+path, the hierarchical configuration barely benefits from it, and changing
+the dispatch path mid-campaign makes a seed difference impossible to
+attribute.
