@@ -76,6 +76,7 @@ pub fn sparse_routing_perm(
 ///
 /// `bound` is sized so the padded tensor stays ~tens of MB regardless
 /// of how skewed the cap firing distribution is.
+#[derive(Clone)]
 pub struct BoundedGroupedRouting {
     pub perm_t: Tensor,
     pub inv_perm_t: Tensor,
@@ -682,4 +683,25 @@ mod tests {
         }
         let _ = DType::F32; // silence unused-import lint on some toolchains
     }
+}
+
+/// Derive the sparse routing structure from cap activations.
+///
+/// This is the only place the routing decision leaves the device: the
+/// argmax result must reach the CPU to build the permutation. Callers
+/// that route several projections by the same `cap_acts` should call
+/// this once and share the result. Recomputing it per projection returns
+/// an identical structure - the argmax is deterministic over the same
+/// tensor - at the cost of one device synchronisation each time.
+pub fn routing_from_cap_acts(
+    cap_acts: &Tensor,
+    n_caps: usize,
+    device: &Device,
+) -> Result<BoundedGroupedRouting> {
+    let dims = cap_acts.dims();
+    let total: usize = dims[..dims.len() - 1].iter().product();
+    let cap_flat = cap_acts.reshape((total, n_caps))?;
+    let winners_t = cap_flat.argmax(candle_core::D::Minus1)?;
+    let winners: Vec<u32> = winners_t.to_vec1::<u32>()?;
+    bounded_grouped_routing(&winners, n_caps, device)
 }

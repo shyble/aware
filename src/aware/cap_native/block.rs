@@ -5,6 +5,7 @@ use candle_nn::VarMap;
 
 use super::attention::CapKeyedMha;
 use super::compression::RoutingMode;
+use super::sparse_routing::BoundedGroupedRouting;
 use super::moe::CapMoeMlp;
 use super::norm::CapKeyedRmsNorm;
 
@@ -99,11 +100,22 @@ impl CapNativeBlock {
     /// `cap_acts` is the same signal threaded through every block - from
     /// the substrate-level discovered CapLayer.
     pub fn forward(&self, h: &Tensor, cap_acts: &Tensor) -> CResult<Tensor> {
+        self.forward_with_routing(h, cap_acts, None)
+    }
+
+    /// Forward with an optional precomputed routing structure, shared by
+    /// every cap-keyed projection in the block.
+    pub fn forward_with_routing(
+        &self,
+        h: &Tensor,
+        cap_acts: &Tensor,
+        routing: Option<&BoundedGroupedRouting>,
+    ) -> CResult<Tensor> {
         let normed1 = self.norm1.forward(h, cap_acts)?;
-        let attn_out = self.attn.forward(&normed1, cap_acts)?;
+        let attn_out = self.attn.forward_with_routing(&normed1, cap_acts, routing)?;
         let h = (h + attn_out)?;
         let normed2 = self.norm2.forward(&h, cap_acts)?;
-        let moe_out = self.moe.forward(&normed2, cap_acts)?;
+        let moe_out = self.moe.forward_with_routing(&normed2, cap_acts, routing)?;
         h + moe_out
     }
 }
