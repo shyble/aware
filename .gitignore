@@ -46,3 +46,8 @@ papers/build/
 *.tex.bak
 __pycache__/
 *.pyc
+
+# Tokenised corpus caches: regenerated from the .txt + tokenizer on first
+# run, so they are derived data, not evidence.
+data/**/*.bin
+!data/**/bpe.bin

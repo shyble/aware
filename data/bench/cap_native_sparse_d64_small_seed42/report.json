@@ -1,0 +1,31 @@
+{
+ "run_id": "cap_native_sparse_d64_small_seed42",
+ "architecture": "cap_native",
+ "seed": 42,
+ "train_corpus": "data/tinystories_small/tinystories_train.txt",
+ "val_corpus": "data/tinystories_small/tinystories_val.txt",
+ "d_model": 64,
+ "n_blocks": 2,
+ "n_heads": 4,
+ "d_ff": 256,
+ "cap_discovery": "kmeans",
+ "n_caps_target": 32,
+ "cap_window": 4,
+ "top_k": 1,
+ "cap_indexed_mask": false,
+ "routing": "HardTop1Sparse",
+ "steps": 200,
+ "effective_epochs": 0.23,
+ "tokens_trained": 819200,
+ "final_train_loss": 5.1382,
+ "final_val_loss": 5.1391,
+ "final_val_perplexity": 170.57,
+ "params": 5296128,
+ "wall_clock_seconds": 105.2,
+ "trajectory": [
+ {"step":50,"train_loss":5.8293,"val_loss":5.8292,"val_perplexity":340.09,"elapsed_s":26.4},
+ {"step":100,"train_loss":5.3965,"val_loss":5.4050,"val_perplexity":222.53,"elapsed_s":52.6},
+ {"step":150,"train_loss":5.2723,"val_loss":5.2325,"val_perplexity":187.26,"elapsed_s":79.0},
+ {"step":200,"train_loss":5.1382,"val_loss":5.1391,"val_perplexity":170.57,"elapsed_s":105.2}
+ ]
+}
