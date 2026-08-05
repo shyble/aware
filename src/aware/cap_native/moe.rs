@@ -146,7 +146,7 @@ impl CapMoeMlp {
         out_flat.reshape(out_dims)
     }
 
-    fn forward_sparse_top1(
+    pub(crate) fn forward_sparse_top1(
         &self,
         h: &Tensor,
         cap_acts: &Tensor,
@@ -486,5 +486,45 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod blocksparse_parity_tests {
+    use super::*;
+    use candle_core::{DType, Device, Tensor};
+    use candle_nn::VarMap;
+    use std::sync::{Arc, Mutex};
+
+    /// The device-routed MoE path must agree with the host-routed one on
+    /// the same weights and inputs. Any gap here is a wiring bug: the
+    /// projection itself is covered by
+    /// `blocksparse::tests::projection_matches_naive_reference`.
+    #[test]
+    fn moe_paths_agree() -> CResult<()> {
+        let dev = Device::Cpu;
+        let (n_caps, d_model, d_ff, total) = (8, 16, 32, 40);
+        let varmap = Arc::new(Mutex::new(VarMap::new()));
+        let moe = CapMoeMlp::new(
+            n_caps, d_model, d_ff, 1, "test", varmap, dev.clone(), DType::F32,
+        )?;
+
+        let h = Tensor::randn(0f32, 1f32, (total, d_model), &dev)?;
+        // Skewed on purpose so at least one bucket needs a second pass.
+        let mut acts = vec![0f32; total * n_caps];
+        for t in 0..total {
+            acts[t * n_caps + if t < 25 { 0 } else { t % n_caps }] = 1.0;
+        }
+        let cap_acts = Tensor::from_vec(acts, (total, n_caps), &dev)?;
+
+        std::env::remove_var("AWARE_CN_BLOCKSPARSE");
+        let host = moe.forward_sparse_top1(&h, &cap_acts, None)?;
+        std::env::set_var("AWARE_CN_BLOCKSPARSE", "1");
+        let device_routed = moe.forward_sparse_top1(&h, &cap_acts, None)?;
+        std::env::remove_var("AWARE_CN_BLOCKSPARSE");
+
+        let diff = (host - device_routed)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(diff < 1e-4, "MoE paths disagree by {diff}");
+        Ok(())
     }
 }

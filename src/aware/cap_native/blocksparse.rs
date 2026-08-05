@@ -133,11 +133,11 @@ pub fn blocksparse_routing(
     // broadcast comparison, so build the one-hot by scattering a 1.0 into
     // each row's winning column instead.
     let winners_i64 = winners_t.to_dtype(DType::I64)?;
-    let winners_col = winners_i64.reshape((total, 1))?;
+    let winners_col = winners_i64.reshape((total, 1))?.contiguous()?;
     let ones_col = Tensor::ones((total, 1), DType::F32, device)?;
     let one_hot = Tensor::zeros((total, n_caps), DType::F32, device)?
         .scatter_add(&winners_col, &ones_col, 1)?;
-    let running = one_hot.cumsum(0)?;
+    let running = one_hot.cumsum(0)?.contiguous()?;
 
     // `gather` along the cap axis picks each token's own column; subtract
     // one to turn a count into a zero-based position.
@@ -197,11 +197,16 @@ pub fn apply_blocksparse_projection(
 
     let mut acc: Option<Tensor> = None;
 
+    // Scalar arithmetic on a Tensor routes through `affine`, which is
+    // float-only, so integer constants have to arrive as tensors and go
+    // through the broadcast ops instead.
+    let capacity_t = Tensor::new(&[capacity as i64], device)?;
+
     for pass in 0..routing.n_passes {
-        let lo = (pass * capacity) as i64;
+        let lo_t = Tensor::new(&[(pass * capacity) as i64], device)?;
 
         // Tokens whose bucket position falls in this pass's window.
-        let local = (&pos_i64 - lo)?;
+        let local = pos_i64.broadcast_sub(&lo_t)?;
         let in_pass = local
             .ge(0i64)?
             .mul(&local.lt(capacity as i64)?)?
@@ -209,7 +214,7 @@ pub fn apply_blocksparse_projection(
 
         // Destination slot within the padded block layout. Tokens outside
         // this pass are parked at slot 0 and masked to the sentinel.
-        let slot = ((&winners_i64 * capacity as f64)? + &local)?;
+        let slot = winners_i64.broadcast_mul(&capacity_t)?.add(&local)?;
         let slot = (slot * &in_pass)?;
         let src = (&token_ids * &in_pass)?;
 
@@ -238,4 +243,47 @@ pub fn apply_blocksparse_projection(
     }
 
     acc.ok_or_else(|| candle_core::Error::Msg("blocksparse: no passes executed".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::Device;
+
+    /// The projection must equal the naive definition: every token
+    /// multiplied by its own winning cap's slab. Checked token by token so
+    /// a failure localises to a token rather than to an aggregate.
+    #[test]
+    fn projection_matches_naive_reference() -> Result<()> {
+        let dev = Device::Cpu;
+        let (total, n_caps, d_in, d_out) = (37, 5, 6, 4);
+
+        // Deterministic, deliberately skewed cap activations so some
+        // buckets overflow one capacity block and force multiple passes.
+        let mut acts = vec![0f32; total * n_caps];
+        for t in 0..total {
+            let winner = if t < 20 { 0 } else { t % n_caps };
+            acts[t * n_caps + winner] = 1.0;
+        }
+        let cap_acts = Tensor::from_vec(acts, (total, n_caps), &dev)?;
+        let xs = Tensor::randn(0f32, 1f32, (total, d_in), &dev)?;
+        let weights = Tensor::randn(0f32, 1f32, (n_caps, d_in, d_out), &dev)?;
+
+        let routing = blocksparse_routing(&cap_acts, n_caps, &dev)?;
+        let got = apply_blocksparse_projection(&xs, &weights, &routing)?;
+
+        let winners: Vec<u32> = routing.winners_t.to_vec1()?;
+        for t in 0..total {
+            let k = winners[t] as usize;
+            let want = xs
+                .narrow(0, t, 1)?
+                .matmul(&weights.narrow(0, k, 1)?.squeeze(0)?)?;
+            let diff = (got.narrow(0, t, 1)? - want)?
+                .abs()?
+                .max_all()?
+                .to_scalar::<f32>()?;
+            assert!(diff < 1e-4, "token {t} (cap {k}) differs by {diff}");
+        }
+        Ok(())
+    }
 }

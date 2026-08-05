@@ -4,10 +4,14 @@
 # Same config, same seed, same step count -- one environment variable
 # apart. Answers two questions in order:
 #
-#   1. Does it compute the same thing?  Compare final_val_perplexity.
-#      Each token's output is x_t @ W_cap(t) either way, so the expected
-#      answer is "identical". A small difference means the matmul
-#      reassociated; a large one means a bug.
+#   1. Does it compute the same thing?  NOT answerable from perplexity:
+#      this harness is not run-to-run deterministic. Two identical runs
+#      (same seed, same flag, same binary) spread ~9 ppl at 30 steps on
+#      TinyStories. Correctness is settled instead by two unit tests that
+#      compare tensors directly:
+#        cargo test --features candle --lib cap_native::blocksparse
+#        cargo test --features candle --lib moe_paths_agree
+#      Run those first. This script measures SPEED.
 #   2. Is it faster?  Compare wall_clock_seconds. Only meaningful on
 #      CUDA -- on CPU there is no host round trip to remove, so expect
 #      no gain there and possibly a small loss.
@@ -71,15 +75,9 @@ print(f"  {'seconds':<12}{wa:>14.1f}{wb:>16.1f}")
 print(f"  {'s/step':<12}{wa/a['steps']:>14.3f}{wb/b['steps']:>16.3f}")
 
 print()
-if pa == pb:
-    print("  CORRECTNESS: identical -- pure optimisation, safe to keep.")
-elif abs(pa - pb) < 0.01:
-    print(f"  CORRECTNESS: differs by {abs(pa-pb):.2e} -- consistent with")
-    print("    floating-point reassociation. Compare across seeds before")
-    print("    using this path for any reported number.")
-else:
-    print(f"  CORRECTNESS: differs by {abs(pa-pb):.4f} -- too large for")
-    print("    reassociation. Treat as a BUG, not a numerics artefact.")
+print(f"  ppl gap {abs(pa-pb):.3f} -- NOT a correctness signal. This harness")
+print("    is not deterministic; identical reruns differ by a similar amount.")
+print("    Correctness lives in the unit tests, not here.")
 
 if wa > 0 and wb > 0:
     print(f"  SPEED: {'%.1f%% faster' % (100*(wa-wb)/wa) if wb < wa else '%.1f%% slower' % (100*(wb-wa)/wa)}")
