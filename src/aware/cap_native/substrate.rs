@@ -27,6 +27,10 @@ pub struct CapNativeSubstrate {
     pub blocks: Vec<CapNativeBlock>,
     pub final_norm: CapKeyedRmsNorm,
     pub output: CapKeyedOutput,
+    /// Per-cap decisions for the current cycle. Empty until the first
+    /// `begin_cycle`; persisted with the checkpoint so a cycle's
+    /// judgements survive save/load alongside cap identity.
+    pub registry: super::registry::CommitRegistry,
 }
 
 impl CapNativeSubstrate {
@@ -45,6 +49,11 @@ impl CapNativeSubstrate {
     /// bit-identical to the model before the call. Cap keys are not
     /// touched — identity is anchored, not provisional.
     pub fn begin_cycle(&mut self) -> CResult<()> {
+        if self.registry.is_empty() {
+            self.registry =
+                super::registry::CommitRegistry::new(self.config.downstream_n_caps());
+        }
+        self.registry.begin_cycle();
         for block in &mut self.blocks {
             block.norm1.begin_cycle()?;
             block.norm2.begin_cycle()?;
@@ -59,6 +68,9 @@ impl CapNativeSubstrate {
     /// Fold cap `k`'s provisional learning into committed knowledge,
     /// across every cap-keyed component. Other caps are untouched.
     pub fn commit_cap(&mut self, k: usize) -> CResult<()> {
+        if k < self.registry.len() {
+            self.registry.records[k].decision = super::registry::CapDecision::Committed;
+        }
         for block in &mut self.blocks {
             block.norm1.commit_cap(k)?;
             block.norm2.commit_cap(k)?;
@@ -72,6 +84,9 @@ impl CapNativeSubstrate {
 
     /// Discard cap `k`'s provisional learning, restoring it exactly.
     pub fn rollback_cap(&mut self, k: usize) -> CResult<()> {
+        if k < self.registry.len() {
+            self.registry.records[k].decision = super::registry::CapDecision::RolledBack;
+        }
         for block in &mut self.blocks {
             block.norm1.rollback_cap(k)?;
             block.norm2.rollback_cap(k)?;
@@ -86,6 +101,22 @@ impl CapNativeSubstrate {
     /// Whether a cycle is currently running (weights are split).
     pub fn in_cycle(&self) -> bool {
         self.output.w_base.is_some()
+    }
+
+    /// Largest absolute delta across a cap's slabs — how much this cycle
+    /// wanted to change it. Exactly zero means the cap never fired, which
+    /// the audit must distinguish from "fired but was refused".
+    pub fn cap_delta_magnitude(&self, k: usize) -> CResult<f32> {
+        let mut m: f32 = 0.0;
+        for block in &self.blocks {
+            m = m.max(super::slab::delta_magnitude(&block.attn.w_qkv, k)?);
+            m = m.max(super::slab::delta_magnitude(&block.attn.w_o, k)?);
+            m = m.max(super::slab::delta_magnitude(&block.moe.w_gate, k)?);
+            m = m.max(super::slab::delta_magnitude(&block.moe.w_value, k)?);
+            m = m.max(super::slab::delta_magnitude(&block.moe.w_out, k)?);
+        }
+        m = m.max(super::slab::delta_magnitude(&self.output.w, k)?);
+        Ok(m)
     }
 
     /// Winning cap per token at each discovered layer, for identity
@@ -499,6 +530,7 @@ impl CapNativeBuilder {
             blocks,
             final_norm,
             output,
+            registry: super::registry::CommitRegistry::new(0),
         })
     }
 }

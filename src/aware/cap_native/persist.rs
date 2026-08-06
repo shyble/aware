@@ -44,6 +44,10 @@ struct CkptMeta {
     version: u32,
     l0: LayerMeta,
     l1: Option<LayerMeta>,
+    /// Per-cap decisions. Absent in pre-cycle checkpoints, which load
+    /// fine — a model that has never run a cycle has nothing to record.
+    #[serde(default)]
+    registry: Option<super::registry::CommitRegistry>,
 }
 
 fn msg(e: impl std::fmt::Display) -> candle_core::Error {
@@ -74,6 +78,44 @@ pub fn save_checkpoint(model: &CapNativeSubstrate, path: &str) -> CResult<()> {
         }
     }
 
+    // During a continual-learning cycle the varmap holds DELTAS and the
+    // committed bases live outside it. Saving only the varmap would
+    // persist the provisional half of every weight and silently lose all
+    // committed knowledge — the same class of failure as dropping the
+    // frozen cap keys.
+    if model.in_cycle() {
+        for (bi, block) in model.blocks.iter().enumerate() {
+            let p = format!("__capnative__.base.block.{bi}");
+            if let Some(t) = &block.attn.qkv_base {
+                tensors.insert(format!("{p}.attn.w_qkv"), t.clone());
+            }
+            if let Some(t) = &block.attn.o_base {
+                tensors.insert(format!("{p}.attn.w_o"), t.clone());
+            }
+            if let Some(t) = &block.moe.gate_base {
+                tensors.insert(format!("{p}.moe.w_gate"), t.clone());
+            }
+            if let Some(t) = &block.moe.value_base {
+                tensors.insert(format!("{p}.moe.w_value"), t.clone());
+            }
+            if let Some(t) = &block.moe.out_base {
+                tensors.insert(format!("{p}.moe.w_out"), t.clone());
+            }
+            if let Some(t) = &block.norm1.weight_base {
+                tensors.insert(format!("{p}.norm1.weight"), t.clone());
+            }
+            if let Some(t) = &block.norm2.weight_base {
+                tensors.insert(format!("{p}.norm2.weight"), t.clone());
+            }
+        }
+        if let Some(t) = &model.final_norm.weight_base {
+            tensors.insert("__capnative__.base.final_norm.weight".into(), t.clone());
+        }
+        if let Some(t) = &model.output.w_base {
+            tensors.insert("__capnative__.base.output.w".into(), t.clone());
+        }
+    }
+
     candle_core::safetensors::save(&tensors, path)?;
 
     let meta = CkptMeta {
@@ -86,6 +128,11 @@ pub fn save_checkpoint(model: &CapNativeSubstrate, path: &str) -> CResult<()> {
             ids: l1.caps.ids.clone(),
             metadata: l1.caps.metadata.clone(),
         }),
+        registry: if model.registry.is_empty() {
+            None
+        } else {
+            Some(model.registry.clone())
+        },
     };
     let bytes = bincode::serialize(&meta).map_err(msg)?;
     std::fs::write(format!("{path}.meta"), bytes).map_err(msg)?;
@@ -182,6 +229,24 @@ pub fn load_checkpoint(model: &mut CapNativeSubstrate, path: &str) -> CResult<()
         Ok(())
     };
 
+    // Committed bases, if this checkpoint was taken mid-cycle. Their
+    // presence is what tells us the model was split.
+    if all.contains_key("__capnative__.base.output.w") {
+        for (bi, block) in model.blocks.iter_mut().enumerate() {
+            let p = format!("__capnative__.base.block.{bi}");
+            block.attn.qkv_base = all.get(&format!("{p}.attn.w_qkv")).cloned();
+            block.attn.o_base = all.get(&format!("{p}.attn.w_o")).cloned();
+            block.moe.gate_base = all.get(&format!("{p}.moe.w_gate")).cloned();
+            block.moe.value_base = all.get(&format!("{p}.moe.w_value")).cloned();
+            block.moe.out_base = all.get(&format!("{p}.moe.w_out")).cloned();
+            block.norm1.weight_base = all.get(&format!("{p}.norm1.weight")).cloned();
+            block.norm2.weight_base = all.get(&format!("{p}.norm2.weight")).cloned();
+        }
+        model.final_norm.weight_base =
+            all.get("__capnative__.base.final_norm.weight").cloned();
+        model.output.w_base = all.get("__capnative__.base.output.w").cloned();
+    }
+
     restore(&mut model.cap_layer.caps, &meta.l0, "layer 0")?;
     match (&mut model.cap_layer_1, &meta.l1) {
         (Some(l1), Some(lm)) => restore(&mut l1.caps, lm, "layer 1")?,
@@ -191,6 +256,10 @@ pub fn load_checkpoint(model: &mut CapNativeSubstrate, path: &str) -> CResult<()
                 "checkpoint sidecar {meta_path}: hierarchical-ness disagrees with model"
             )))
         }
+    }
+
+    if let Some(reg) = meta.registry {
+        model.registry = reg;
     }
 
     Ok(())
@@ -298,6 +367,93 @@ mod tests {
             .with_device(dev)
             .build()?;
         assert!(load_checkpoint(&mut model_b, path).is_err());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cycle_persist_tests {
+    use super::*;
+    use crate::aware::cap_native::config::CapNativeConfig;
+    use crate::aware::cap_native::registry::CapDecision;
+    use crate::aware::cap_native::CapNativeBuilder;
+    use candle_core::{DType, Device, Tensor};
+
+    fn cfg(disc: crate::aware::DiscoveryKind) -> CapNativeConfig {
+        let mut c = CapNativeConfig::default();
+        c.vocab = 48; c.d_model = 16; c.n_blocks = 2; c.d_ff = 32; c.n_heads = 2;
+        c.cap_config.n_caps_target = 8;
+        c.cap_config.cap_window = 2;
+        c.cap_config.discovery = disc;
+        c.routing = crate::aware::cap_native::compression::RoutingMode::HardTop1Sparse;
+        c.top_k = 1;
+        c
+    }
+
+    /// D2 acceptance: a checkpoint taken MID-CYCLE must round-trip
+    /// exactly — committed bases, live deltas and per-cap decisions.
+    /// Saving only the varmap here would persist the provisional half of
+    /// every weight and lose all committed knowledge silently.
+    #[test]
+    fn mid_cycle_checkpoint_roundtrips() -> CResult<()> {
+        let dev = Device::Cpu;
+        let mut a = CapNativeBuilder::default()
+            .with_config(cfg(crate::aware::DiscoveryKind::Random))
+            .with_device(dev.clone())
+            .build()?;
+        a.begin_cycle()?;
+
+        // A cycle that learned something, then judged two caps.
+        for block in &a.blocks {
+            let d = block.attn.w_qkv.as_tensor();
+            block.attn.w_qkv.set(&Tensor::randn(0f32, 0.1f32, d.dims(), &dev)?)?;
+        }
+        a.commit_cap(1)?;
+        a.rollback_cap(2)?;
+
+        let batch = Tensor::from_vec((0..24u32).map(|i| i % 48).collect::<Vec<_>>(), (2, 12), &dev)?
+            .to_dtype(DType::U32)?;
+        let logits_a = a.forward(&batch)?.copy()?;
+
+        let dir = std::env::temp_dir().join("capnative_cycle_ckpt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.safetensors");
+        let path = path.to_str().unwrap();
+        save_checkpoint(&a, path)?;
+
+        let mut b = CapNativeBuilder::default()
+            .with_config(cfg(crate::aware::DiscoveryKind::NoDiscovery))
+            .with_device(dev)
+            .build()?;
+        load_checkpoint(&mut b, path)?;
+
+        assert!(b.in_cycle(), "loaded model lost its cycle state");
+        let diff = (logits_a - b.forward(&batch)?)?
+            .abs()?.max_all()?.to_scalar::<f32>()?;
+        assert_eq!(diff, 0.0, "mid-cycle round-trip changed the forward pass: {diff}");
+
+        assert_eq!(b.registry.decision(1), CapDecision::Committed);
+        assert_eq!(b.registry.decision(2), CapDecision::RolledBack);
+        Ok(())
+    }
+
+    /// Untouched caps must be distinguishable from refused ones: a cap
+    /// that never fired has an exactly-zero delta.
+    #[test]
+    fn delta_magnitude_separates_untouched_from_refused() -> CResult<()> {
+        let dev = Device::Cpu;
+        let mut m = CapNativeBuilder::default()
+            .with_config(cfg(crate::aware::DiscoveryKind::Random))
+            .with_device(dev.clone())
+            .build()?;
+        m.begin_cycle()?;
+        assert_eq!(m.cap_delta_magnitude(0)?, 0.0, "fresh cycle should have zero deltas");
+
+        let d = m.blocks[0].attn.w_qkv.as_tensor();
+        m.blocks[0].attn.w_qkv.set(&Tensor::ones(d.dims(), d.dtype(), &dev)?)?;
+        assert!(m.cap_delta_magnitude(0)? > 0.0);
+        m.rollback_cap(0)?;
+        assert_eq!(m.cap_delta_magnitude(0)?, 0.0, "rollback should zero the delta");
         Ok(())
     }
 }

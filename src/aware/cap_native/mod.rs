@@ -9,6 +9,7 @@ pub mod moe;
 pub mod norm;
 pub mod output;
 pub mod persist;
+pub mod registry;
 pub mod slab;
 pub mod sparse_routing;
 pub mod substrate;
@@ -24,5 +25,6 @@ pub use moe::CapMoeMlp;
 pub use norm::{top_k_softmax, CapKeyedRmsNorm};
 pub use output::CapKeyedOutput;
 pub use persist::{load_checkpoint, save_checkpoint};
+pub use registry::{CapDecision, CapRecord, CommitRegistry};
 
 pub use substrate::{CapNativeBuilder, CapNativeSubstrate};
