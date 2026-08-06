@@ -82,7 +82,12 @@ def cmd_slabs(path_a, path_b):
             tag = "IDENTICAL" if raw_a == raw_b else "CHANGED"
             print(f"  [caps-meta] {name:<40} {tag}")
             continue
-        if shape_a and shape_a[0] == n_caps and len(shape_a) >= 2:
+        # Shared tensors are identified by NAME, not shape: at the
+        # reference configuration d_model == K1 == 128, the shared
+        # projection matrices coincidentally have a K-sized leading dim
+        # and shape alone misclassifies them as cap-keyed.
+        is_shared = name == "embeddings.weight" or ".w_proj." in name
+        if not is_shared and shape_a and shape_a[0] == n_caps and len(shape_a) >= 2:
             per = len(raw_a) // n_caps
             for k in range(n_caps):
                 if raw_a[k * per : (k + 1) * per] != raw_b[k * per : (k + 1) * per]:

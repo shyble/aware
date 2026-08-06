@@ -215,8 +215,17 @@ fn main() -> Result<()> {
     let shared_n = env_usize("AWARE_BENCH_SHARED_N", 512);
 
     let include_cap_layer = env_bool("AWARE_BENCH_INCLUDE_CAP_LAYER", true);
+    // Continual-learning plumbing (mirrors cap_native_run_benchmark):
+    // LOAD skips discovery (the checkpoint supplies keys and identity),
+    // SAVE writes a complete checkpoint at the end of the run.
+    let load_weights = env::var("AWARE_BENCH_LOAD_WEIGHTS").ok();
+    let save_weights = env::var("AWARE_BENCH_SAVE_WEIGHTS").ok();
     let discovery_str = env_str("AWARE_BENCH_CAP_DISCOVERY", "nodiscovery");
-    let discovery = parse_discovery(&discovery_str);
+    let discovery = if load_weights.is_some() {
+        DiscoveryKind::NoDiscovery
+    } else {
+        parse_discovery(&discovery_str)
+    };
     let n_caps_target = env_usize("AWARE_BENCH_CAP_N_TARGET", 330);
     let cap_window = env_usize("AWARE_BENCH_CAP_WINDOW", 1);
 
@@ -378,7 +387,12 @@ fn main() -> Result<()> {
         .with_ffn(d_ff)
         .build();
     builder = builder.with_block_repeated(n_blocks, block);
-    let model = builder.build()?;
+    let mut model = builder.build()?;
+    if let Some(ckpt) = &load_weights {
+        model.load_checkpoint(ckpt)?;
+        println!("[bench] loaded checkpoint: {}", ckpt);
+    }
+    let model = model;
     let n_params = model.n_params();
     println!(
         "[bench] params: {} ({:.2} MB)",
@@ -419,6 +433,73 @@ fn main() -> Result<()> {
     // ── Optimizer ──
     let mut opt = OptimizerKind::AdamW { lr }.build(&model.varmap)?;
     let loss_kind = LossKind::CrossEntropy;
+
+    // ── Eval-only mode (continual-learning instrumentation) ──
+    // Deterministic pass over val (feeder seeded from AWARE_BENCH_SEED,
+    // so two eval-only runs at the same seed score the same tokens).
+    // Winner dump: argmax over the input cap layer's activations. This
+    // layer is dense — all caps are read downstream — so the argmax is a
+    // fingerprint of dominant response, not a routing decision; it is
+    // the correct identity probe for this architecture.
+    if env_bool("AWARE_BENCH_EVAL_ONLY", false) {
+        let n_batches = env_usize("AWARE_BENCH_EVAL_BATCHES", 64);
+        let dump_path = env::var("AWARE_CN_DUMP_WINNERS").ok();
+        let mut total_loss = 0.0f32;
+        let mut win_parts: Vec<candle_core::Tensor> = Vec::new();
+        for _ in 0..n_batches {
+            let (inp, tgt) = val_feeder.next_batch(&device)?;
+            let logits = model.forward(&inp)?;
+            let (b, t, v) = logits.dims3()?;
+            let loss = candle_nn::loss::cross_entropy(
+                &logits.reshape((b * t, v))?,
+                &tgt.reshape((b * t,))?,
+            )?;
+            total_loss += loss.to_scalar::<f32>()?;
+            if dump_path.is_some() {
+                if let Some(cl) = &model.cap_layer {
+                    let embeds = model.embed.forward(&inp)?;
+                    let acts = cl.cap_activations(&embeds)?;
+                    let win = acts.argmax(candle_core::D::Minus1)?;
+                    win_parts.push(win.flatten_all()?);
+                }
+            }
+        }
+        let avg_loss = total_loss / n_batches.max(1) as f32;
+        println!(
+            "[bench] EVAL-ONLY over {} batches: val_loss={:.4} val_ppl={:.2}",
+            n_batches,
+            avg_loss,
+            (avg_loss as f64).exp()
+        );
+        if let Some(path) = dump_path {
+            if !win_parts.is_empty() {
+                let refs: Vec<&candle_core::Tensor> = win_parts.iter().collect();
+                let all = candle_core::Tensor::cat(&refs, 0)?;
+                let host: Vec<u32> = all.to_vec1()?;
+                let mut buf = Vec::with_capacity(host.len() * 4);
+                for w in &host {
+                    buf.extend_from_slice(&w.to_le_bytes());
+                }
+                let out = format!("{}.l0.bin", path);
+                fs::write(&out, buf)
+                    .map_err(|e| candle_core::Error::Msg(format!("write winners: {}", e)))?;
+                println!("[bench] winners: {} ({} tokens)", out, host.len());
+            } else {
+                println!("[bench] winners: model has no cap layer; nothing to dump");
+            }
+        }
+        let report = format!(
+            "{{\n  \"run_id\": \"{}\",\n  \"eval_only\": true,\n  \"seed\": {},\n  \"device\": \"{}\",\n  \"backend_features\": \"{}\",\n  \"val_corpus\": \"{}\",\n  \"eval_batches\": {},\n  \"final_val_loss\": {:.4},\n  \"final_val_perplexity\": {:.2}\n}}\n",
+            run_id, seed, device_label(&device), BACKEND_FEATURES,
+            val_corpus_path.as_deref().unwrap_or("?"),
+            n_batches, avg_loss, (avg_loss as f64).exp(),
+        );
+        let report_path = format!("{}/report.json", run_dir);
+        fs::write(&report_path, report)
+            .map_err(|e| candle_core::Error::Msg(format!("write report: {}", e)))?;
+        println!("[bench] report: {}", report_path);
+        return Ok(());
+    }
 
     // ── Training loop with val + trajectory ──
     let start = Instant::now();
@@ -504,5 +585,13 @@ fn main() -> Result<()> {
     fs::write(&report_path, report_json)
         .map_err(|e| candle_core::Error::Msg(format!("write report: {}", e)))?;
     println!("[bench] report: {}", report_path);
+
+    if let Some(ckpt) = &save_weights {
+        if let Some(parent) = std::path::Path::new(ckpt).parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        model.save_checkpoint(ckpt)?;
+        println!("[bench] weights: {} (+ .meta)", ckpt);
+    }
     Ok(())
 }
