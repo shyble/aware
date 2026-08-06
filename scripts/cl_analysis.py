@@ -57,11 +57,16 @@ def cmd_slabs(path_a, path_b):
         sys.exit(f"tensor sets differ; only in A: {only_a}, only in B: {only_b}")
 
     # The routing cap count: layer 1 if hierarchical, else layer 0.
-    keys_name = (
-        CKPT_PREFIX + "l1.keys"
-        if CKPT_PREFIX + "l1.keys" in a
-        else CKPT_PREFIX + "l0.keys"
-    )
+    # Two checkpoint dialects: cap-native ("__capnative__.") and the
+    # cap-augmented/paper-1 substrate ("__aware__.").
+    candidates = [
+        CKPT_PREFIX + "l1.keys",
+        CKPT_PREFIX + "l0.keys",
+        "__aware__.cap_layer.keys",
+    ]
+    keys_name = next((k for k in candidates if k in a), None)
+    if keys_name is None:
+        sys.exit("no cap keys found in checkpoint (dense model? nothing to attribute)")
     n_caps = a[keys_name][1][0]
     print(f"routing caps: {n_caps}  (from {keys_name})")
 
@@ -78,7 +83,7 @@ def cmd_slabs(path_a, path_b):
         (dt_b, shape_b, raw_b) = b[name]
         if shape_a != shape_b or dt_a != dt_b:
             sys.exit(f"{name}: shape/dtype mismatch {shape_a}/{dt_a} vs {shape_b}/{dt_b}")
-        if name.startswith(CKPT_PREFIX):
+        if name.startswith(CKPT_PREFIX) or name.startswith("__aware__."):
             tag = "IDENTICAL" if raw_a == raw_b else "CHANGED"
             print(f"  [caps-meta] {name:<40} {tag}")
             continue

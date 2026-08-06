@@ -1,5 +1,19 @@
 # Block-sparse dispatch — status and verification protocol
 
+## VERDICT (measured 2026-08-06, RTX 4060, cap_native_hier_d128, 200 steps)
+
+| path | s/step |
+|---|---|
+| default host-routed | 0.472 |
+| AWARE_CN_BLOCKSPARSE=1 | 1.879 |
+
+**4x SLOWER on CUDA. Do not use.** The multi-pass gather/scatter dispatch
+costs far more than the host round-trip it avoids, and as wired it only
+covered the MoE while attention/output still built the host routing
+anyway. Forward parity held (identical ppl). The approach is dead; if
+dispatch ever needs real work, the grouped-GEMM kernel
+(`kernels/grouped_gemm.cu`) is the only live path.
+
 Branch `block-sparse`, off `gpu-dispatch` (which already contains the
 routing hoist: 30.4 → 19.6 s/step on the 368 M single-discovery config).
 
