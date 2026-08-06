@@ -163,6 +163,21 @@ fn main() -> Result<()> {
     let load_weights = env::var("AWARE_BENCH_LOAD_WEIGHTS").ok();
     let save_weights = env::var("AWARE_BENCH_SAVE_WEIGHTS").ok();
 
+    // ── Continual-learning arm ──
+    //   bare          no deltas; ordinary training (the pilot)
+    //   freeze        split, then discard every delta (L1 floor)
+    //   always_commit split, then merge every delta (the honesty control:
+    //                 isolates whether the GATE does the work, or merely
+    //                 the base/delta split)
+    //   gated         split, then probe-gated per-cap commit (the claim)
+    let cl_arm = env_str("AWARE_CL_ARM", "bare");
+    // Probes come from corpus A, which during cycle B is NOT the corpus
+    // being trained on — hence its own variable.
+    let probe_corpus = env::var("AWARE_CL_PROBE_CORPUS").ok();
+    let n_probes = env_usize("AWARE_CL_PROBES", 2000);
+    let commit_at = env_f64("AWARE_CL_COMMIT_AT", 1.0) as f32;
+    let quarantine_at = env_f64("AWARE_CL_QUARANTINE_AT", 0.9) as f32;
+
     let discovery_str = env_str("AWARE_BENCH_CAP_DISCOVERY", "kmeans");
     let discovery = if load_weights.is_some() {
         // Whatever the preset says, discovery is pointless before a
@@ -348,7 +363,30 @@ fn main() -> Result<()> {
         aware::aware::cap_native::load_checkpoint(&mut model, ckpt)?;
         println!("[cn-bench] loaded checkpoint: {}", ckpt);
     }
-    let model = model; // immutable from here
+
+    // Split into committed base + provisional delta for every arm except
+    // `bare`. Exact: with zero deltas the forward pass is unchanged.
+    if cl_arm != "bare" {
+        model.begin_cycle()?;
+        println!("[cn-bench] CL arm: {} (weights split into base + delta)", cl_arm);
+    }
+
+    // Probe set and BEFORE outcome, captured on the model as it stands
+    // at the start of the cycle — this is A's retained interest.
+    let probes = match (&probe_corpus, cl_arm.as_str()) {
+        (Some(path), _) => {
+            let ps = aware::aware::cap_native::ProbeSet::from_bin(path, n_probes, seq_len)?;
+            let before = ps.score(&model, &device, batch_size)?;
+            println!(
+                "[cn-bench] probes: {} items, {} correct before the cycle",
+                ps.len(),
+                before.n_correct()
+            );
+            Some((ps, before))
+        }
+        _ => None,
+    };
+    let model = model; // immutable during training
     let n_params = model.n_params();
     println!(
         "[cn-bench] params: {} ({:.2} MB)",
@@ -599,6 +637,109 @@ fn main() -> Result<()> {
         true,
     )?;
     println!("[cn-bench] report: {}", report_path);
+
+    // `bare` has no policy to apply, but is the baseline every other arm
+    // is compared against, so it is scored on the same probe set.
+    if cl_arm == "bare" {
+        if let Some((ps, before)) = probes.as_ref() {
+            let after = ps.score(&model, &device, batch_size)?;
+            let kept = after.correct.iter().zip(before.correct.iter())
+                .filter(|(a, b)| **a && **b).count();
+            let had = before.n_correct();
+            println!(
+                "[cn-bench] RETENTION: {}/{} = {:.1}%  (arm=bare)",
+                kept, had,
+                if had > 0 { 100.0 * kept as f64 / had as f64 } else { 0.0 }
+            );
+            let summary = format!(
+                "{{\n \"arm\": \"bare\",\n \"probes_before\": {},\n \"probes_kept\": {},\n \"retention\": {:.4},\n \"registry\": \"n/a (no cycle)\"\n}}\n",
+                had, kept,
+                if had > 0 { kept as f64 / had as f64 } else { 0.0 }
+            );
+            let _ = fs::write(format!("{}/cl_summary.json", run_dir), summary);
+        }
+    }
+
+    // ── Apply the continual-learning arm's policy ──
+    // Training is over; the deltas now hold everything this cycle
+    // proposed. What becomes knowledge is decided here, outside the loss.
+    if cl_arm != "bare" {
+        let mut model = model;
+        let n_caps = model.config.downstream_n_caps();
+        let mags: Vec<f32> = (0..n_caps)
+            .map(|k| model.cap_delta_magnitude(k).unwrap_or(0.0))
+            .collect();
+
+        match cl_arm.as_str() {
+            "freeze" => {
+                for k in 0..n_caps {
+                    model.rollback_cap(k)?;
+                }
+                println!("[cn-bench] arm=freeze: all {} deltas discarded", n_caps);
+            }
+            "always_commit" => {
+                for k in 0..n_caps {
+                    model.commit_cap(k)?;
+                }
+                println!("[cn-bench] arm=always_commit: all {} deltas merged", n_caps);
+            }
+            "gated" => {
+                let Some((ps, before)) = probes.as_ref() else {
+                    eprintln!("ERROR: arm=gated requires AWARE_CL_PROBE_CORPUS");
+                    std::process::exit(1)
+                };
+                let after = ps.score(&model, &device, batch_size)?;
+                let cfg = aware::aware::cap_native::GateConfig {
+                    commit_at,
+                    quarantine_at,
+                    ..Default::default()
+                };
+                let decisions =
+                    aware::aware::cap_native::audit_gate::decide(before, &after, &mags, &cfg);
+                aware::aware::cap_native::audit_gate::apply(&mut model, &decisions)?;
+                println!("[cn-bench] arm=gated: {}", model.registry.summary());
+            }
+            other => {
+                eprintln!("ERROR: unknown AWARE_CL_ARM '{}'", other);
+                std::process::exit(1)
+            }
+        }
+
+        // Retention after the policy: the number the grid compares.
+        if let Some((ps, before)) = probes.as_ref() {
+            let final_out = ps.score(&model, &device, batch_size)?;
+            let kept = final_out
+                .correct
+                .iter()
+                .zip(before.correct.iter())
+                .filter(|(a, b)| **a && **b)
+                .count();
+            let had = before.n_correct();
+            println!(
+                "[cn-bench] RETENTION: {}/{} = {:.1}%  (arm={})",
+                kept,
+                had,
+                if had > 0 { 100.0 * kept as f64 / had as f64 } else { 0.0 },
+                cl_arm
+            );
+            let summary = format!(
+                "{{\n \"arm\": \"{}\",\n \"probes_before\": {},\n \"probes_kept\": {},\n \"retention\": {:.4},\n \"commit_at\": {},\n \"quarantine_at\": {},\n \"registry\": \"{}\"\n}}\n",
+                cl_arm, had, kept,
+                if had > 0 { kept as f64 / had as f64 } else { 0.0 },
+                commit_at, quarantine_at, model.registry.summary()
+            );
+            let _ = fs::write(format!("{}/cl_summary.json", run_dir), summary);
+        }
+
+        if let Some(ckpt) = &save_weights {
+            if let Some(parent) = std::path::Path::new(ckpt).parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            aware::aware::cap_native::save_checkpoint(&model, ckpt)?;
+            println!("[cn-bench] weights: {} (+ .meta)", ckpt);
+        }
+        return Ok(());
+    }
 
     if let Some(ckpt) = &save_weights {
         if let Some(parent) = std::path::Path::new(ckpt).parent() {
