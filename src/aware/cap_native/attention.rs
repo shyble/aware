@@ -34,6 +34,10 @@ pub struct CapKeyedMha {
     pub top_k: usize,
     pub w_qkv: Var,
     pub w_o: Var,
+    /// Committed bases, present only while a continual-learning cycle
+    /// is running. When set, the Vars above hold provisional deltas.
+    pub qkv_base: Option<Tensor>,
+    pub o_base: Option<Tensor>,
     pub w_qkv_name: String,
     pub w_o_name: String,
     pub varmap: Arc<Mutex<VarMap>>,
@@ -47,6 +51,38 @@ pub struct CapKeyedMha {
 }
 
 impl CapKeyedMha {
+    /// Effective QKV weight: base + delta while a cycle is running.
+    pub fn qkv_effective(&self) -> CResult<Tensor> {
+        super::slab::effective(&self.qkv_base, &self.w_qkv)
+    }
+
+    /// Effective attention-output weight.
+    pub fn o_effective(&self) -> CResult<Tensor> {
+        super::slab::effective(&self.o_base, &self.w_o)
+    }
+
+    /// Begin a continual-learning cycle: freeze current weights as the
+    /// committed base, zero the Vars into provisional deltas.
+    pub fn begin_cycle(&mut self) -> CResult<()> {
+        if self.qkv_base.is_none() {
+            self.qkv_base = Some(super::slab::split(&self.w_qkv)?);
+            self.o_base = Some(super::slab::split(&self.w_o)?);
+        }
+        Ok(())
+    }
+
+    /// Fold cap `k`'s provisional learning into its committed base.
+    pub fn commit_cap(&mut self, k: usize) -> CResult<()> {
+        super::slab::commit_cap(&mut self.qkv_base, &self.w_qkv, k)?;
+        super::slab::commit_cap(&mut self.o_base, &self.w_o, k)
+    }
+
+    /// Discard cap `k`'s provisional learning.
+    pub fn rollback_cap(&mut self, k: usize) -> CResult<()> {
+        super::slab::rollback_cap(&self.w_qkv, k)?;
+        super::slab::rollback_cap(&self.w_o, k)
+    }
+
     pub fn new(
         n_caps: usize,
         d_model: usize,
@@ -90,6 +126,8 @@ impl CapKeyedMha {
             top_k,
             w_qkv,
             w_o,
+            qkv_base: None,
+            o_base: None,
             w_qkv_name,
             w_o_name,
             varmap,
@@ -153,7 +191,8 @@ impl CapKeyedMha {
                 let gate_w_flat = top_k_softmax(&cap_flat, self.top_k)?;
                 let mut qkv_accum: Option<Tensor> = None;
                 for k in 0..self.n_caps {
-                    let w_qkv_k = self.w_qkv.as_tensor().narrow(0, k, 1)?.squeeze(0)?;
+                    let w_qkv_eff = self.qkv_effective()?;
+                    let w_qkv_k = w_qkv_eff.narrow(0, k, 1)?.squeeze(0)?;
                     let qkv_k = xs_flat.matmul(&w_qkv_k)?;
                     let weight_k = gate_w_flat.narrow(D::Minus1, k, 1)?;
                     let weighted = qkv_k.broadcast_mul(&weight_k)?;
@@ -182,7 +221,7 @@ impl CapKeyedMha {
                 let xs_sorted = xs_flat.index_select(&routing.perm_t, 0)?;
                 let qkv_sorted = apply_bounded_grouped_projection(
                     &xs_sorted,
-                    self.w_qkv.as_tensor(),
+                    &self.qkv_effective()?,
                     &routing,
                 )?;
                 let qkv_flat = qkv_sorted.index_select(&routing.inv_perm_t, 0)?;
@@ -253,7 +292,8 @@ impl CapKeyedMha {
             GateState::Soft(gate_w_flat) => {
                 let mut out_accum: Option<Tensor> = None;
                 for k in 0..self.n_caps {
-                    let w_o_k = self.w_o.as_tensor().narrow(0, k, 1)?.squeeze(0)?;
+                    let w_o_eff = self.o_effective()?;
+                    let w_o_k = w_o_eff.narrow(0, k, 1)?.squeeze(0)?;
                     let out_k = attn_flat.matmul(&w_o_k)?;
                     let weight_k = gate_w_flat.narrow(D::Minus1, k, 1)?;
                     let weighted = out_k.broadcast_mul(&weight_k)?;
@@ -268,7 +308,7 @@ impl CapKeyedMha {
                 // Reuse the routing state built for the QKV projection.
                 let attn_sorted = attn_flat.index_select(&routing.perm_t, 0)?;
                 let out_sorted =
-                    apply_bounded_grouped_projection(&attn_sorted, self.w_o.as_tensor(), routing)?;
+                    apply_bounded_grouped_projection(&attn_sorted, &self.o_effective()?, routing)?;
                 out_sorted.index_select(&routing.inv_perm_t, 0)?
             }
         };

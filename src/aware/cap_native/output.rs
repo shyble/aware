@@ -19,6 +19,8 @@ pub struct CapKeyedOutput {
     pub top_k: usize,
     /// (n_caps, d_model, vocab)
     pub w: Var,
+    /// Committed base; present only during a continual-learning cycle.
+    pub w_base: Option<Tensor>,
     pub w_name: String,
     pub varmap: Arc<Mutex<VarMap>>,
     pub init_scale: f64,
@@ -28,6 +30,26 @@ pub struct CapKeyedOutput {
 }
 
 impl CapKeyedOutput {
+    /// Effective vocabulary projection: base + delta during a cycle.
+    pub fn w_effective(&self) -> CResult<Tensor> {
+        super::slab::effective(&self.w_base, &self.w)
+    }
+
+    pub fn begin_cycle(&mut self) -> CResult<()> {
+        if self.w_base.is_none() {
+            self.w_base = Some(super::slab::split(&self.w)?);
+        }
+        Ok(())
+    }
+
+    pub fn commit_cap(&mut self, k: usize) -> CResult<()> {
+        super::slab::commit_cap(&mut self.w_base, &self.w, k)
+    }
+
+    pub fn rollback_cap(&mut self, k: usize) -> CResult<()> {
+        super::slab::rollback_cap(&self.w, k)
+    }
+
     pub fn new(
         n_caps: usize,
         d_model: usize,
@@ -54,6 +76,7 @@ impl CapKeyedOutput {
             vocab,
             top_k,
             w,
+            w_base: None,
             w_name,
             varmap,
             init_scale,
@@ -103,7 +126,8 @@ impl CapKeyedOutput {
 
         let mut accum: Option<Tensor> = None;
         for k in 0..self.n_caps {
-            let w_k = self.w.as_tensor().narrow(0, k, 1)?.squeeze(0)?;
+            let w_eff = self.w_effective()?;
+            let w_k = w_eff.narrow(0, k, 1)?.squeeze(0)?;
             let logits_k = h_flat.matmul(&w_k)?;
             let weight_k = gate_w.narrow(D::Minus1, k, 1)?;
             let weighted = logits_k.broadcast_mul(&weight_k)?;
@@ -146,7 +170,7 @@ impl CapKeyedOutput {
 
         let h_sorted = h_flat.index_select(&routing.perm_t, 0)?;
         let out_sorted =
-            apply_bounded_grouped_projection(&h_sorted, self.w.as_tensor(), &routing)?;
+            apply_bounded_grouped_projection(&h_sorted, &self.w_effective()?, &routing)?;
         let out_flat = out_sorted.index_select(&routing.inv_perm_t, 0)?;
 
         let mut out_dims: Vec<usize> = h_dims[..n_dim - 1].to_vec();

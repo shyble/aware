@@ -34,6 +34,60 @@ impl CapNativeSubstrate {
         CapNativeBuilder::default()
     }
 
+    /// Begin a continual-learning cycle.
+    ///
+    /// Every cap-keyed weight splits into a frozen committed base and a
+    /// zero-initialised provisional delta; the Vars keep their varmap
+    /// registration, so optimizer and checkpointing follow automatically
+    /// and the only tensors receiving gradient are the deltas.
+    ///
+    /// Exact by construction: with zero deltas the forward pass is
+    /// bit-identical to the model before the call. Cap keys are not
+    /// touched — identity is anchored, not provisional.
+    pub fn begin_cycle(&mut self) -> CResult<()> {
+        for block in &mut self.blocks {
+            block.norm1.begin_cycle()?;
+            block.norm2.begin_cycle()?;
+            block.attn.begin_cycle()?;
+            block.moe.begin_cycle()?;
+        }
+        self.final_norm.begin_cycle()?;
+        self.output.begin_cycle()?;
+        Ok(())
+    }
+
+    /// Fold cap `k`'s provisional learning into committed knowledge,
+    /// across every cap-keyed component. Other caps are untouched.
+    pub fn commit_cap(&mut self, k: usize) -> CResult<()> {
+        for block in &mut self.blocks {
+            block.norm1.commit_cap(k)?;
+            block.norm2.commit_cap(k)?;
+            block.attn.commit_cap(k)?;
+            block.moe.commit_cap(k)?;
+        }
+        self.final_norm.commit_cap(k)?;
+        self.output.commit_cap(k)?;
+        Ok(())
+    }
+
+    /// Discard cap `k`'s provisional learning, restoring it exactly.
+    pub fn rollback_cap(&mut self, k: usize) -> CResult<()> {
+        for block in &mut self.blocks {
+            block.norm1.rollback_cap(k)?;
+            block.norm2.rollback_cap(k)?;
+            block.attn.rollback_cap(k)?;
+            block.moe.rollback_cap(k)?;
+        }
+        self.final_norm.rollback_cap(k)?;
+        self.output.rollback_cap(k)?;
+        Ok(())
+    }
+
+    /// Whether a cycle is currently running (weights are split).
+    pub fn in_cycle(&self) -> bool {
+        self.output.w_base.is_some()
+    }
+
     /// Winning cap per token at each discovered layer, for identity
     /// instrumentation. Returns `(l0_winners, l1_winners)` as `(B, S)`
     /// u32 tensors; `l1_winners` is `None` for single-discovery models.
@@ -609,5 +663,140 @@ mod tests {
         let tokens = Tensor::from_vec(vec![0u32, 1, 2, 3], (1, 4), &cpu()).unwrap();
         let logits = model.forward(&tokens).unwrap();
         assert_eq!(logits.dims(), &[1, 4, 32]);
+    }
+}
+
+#[cfg(test)]
+mod cycle_tests {
+    use super::*;
+    use crate::aware::cap_native::config::CapNativeConfig;
+    use candle_core::{DType, Tensor};
+    use candle_nn::Optimizer;
+
+    fn tiny_config() -> CapNativeConfig {
+        let mut cfg = CapNativeConfig::default();
+        cfg.vocab = 48;
+        cfg.d_model = 16;
+        cfg.n_blocks = 2;
+        cfg.d_ff = 32;
+        cfg.n_heads = 2;
+        cfg.cap_config.n_caps_target = 10;
+        cfg.cap_config.cap_window = 2;
+        cfg.cap_config.discovery = crate::aware::DiscoveryKind::Random;
+        cfg.routing = RoutingMode::HardTop1Sparse;
+        cfg.top_k = 1;
+        cfg
+    }
+
+    /// D1 acceptance, part 1: splitting must not change the function.
+    /// A zero delta added to the base is exact in floating point, so the
+    /// logits must match BIT-for-bit, not approximately.
+    #[test]
+    fn begin_cycle_is_bit_identical() -> CResult<()> {
+        let dev = Device::Cpu;
+        let mut model = CapNativeBuilder::default()
+            .with_config(tiny_config())
+            .with_device(dev.clone())
+            .build()?;
+        let batch = Tensor::from_vec((0..24u32).map(|i| i % 48).collect::<Vec<_>>(), (2, 12), &dev)?
+            .to_dtype(DType::U32)?;
+
+        let before = model.forward(&batch)?.copy()?;
+        assert!(!model.in_cycle());
+        model.begin_cycle()?;
+        assert!(model.in_cycle());
+        let after = model.forward(&batch)?;
+
+        let diff = (before - after)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert_eq!(diff, 0.0, "begin_cycle changed the forward pass by {diff}");
+        Ok(())
+    }
+
+    /// D1 acceptance, part 2: during a cycle, a training step must leave
+    /// every committed base byte-identical — all learning lands in the
+    /// deltas. Without this the "commit decides what becomes knowledge"
+    /// claim is unenforceable.
+    #[test]
+    fn training_step_leaves_bases_untouched() -> CResult<()> {
+        let dev = Device::Cpu;
+        let mut model = CapNativeBuilder::default()
+            .with_config(tiny_config())
+            .with_device(dev.clone())
+            .build()?;
+        model.begin_cycle()?;
+
+        let bases_before: Vec<Tensor> = model
+            .blocks
+            .iter()
+            .map(|b| b.attn.qkv_base.as_ref().unwrap().copy().unwrap())
+            .collect();
+
+        let batch = Tensor::from_vec((0..24u32).map(|i| i % 48).collect::<Vec<_>>(), (2, 12), &dev)?
+            .to_dtype(DType::U32)?;
+        let targets = Tensor::from_vec((0..24u32).map(|i| (i + 1) % 48).collect::<Vec<_>>(), (2, 12), &dev)?
+            .to_dtype(DType::U32)?;
+
+        let opt_params = {
+            let vm = model.varmap.lock().unwrap();
+            vm.all_vars()
+        };
+        let mut opt = candle_nn::AdamW::new_lr(opt_params, 1e-2)?;
+        let logits = model.forward(&batch)?;
+        let (b, t, v) = logits.dims3()?;
+        let loss = candle_nn::loss::cross_entropy(
+            &logits.reshape((b * t, v))?,
+            &targets.reshape((b * t,))?,
+        )?;
+        opt.backward_step(&loss)?;
+
+        for (i, block) in model.blocks.iter().enumerate() {
+            let now = block.attn.qkv_base.as_ref().unwrap();
+            let diff = (now - &bases_before[i])?
+                .abs()?
+                .max_all()?
+                .to_scalar::<f32>()?;
+            assert_eq!(diff, 0.0, "block {i} base moved during training: {diff}");
+        }
+        // And the deltas did move — otherwise nothing was learned at all.
+        let moved = model
+            .blocks
+            .iter()
+            .any(|b| b.attn.w_qkv.as_tensor().abs().unwrap().max_all().unwrap()
+                .to_scalar::<f32>().unwrap() > 0.0);
+        assert!(moved, "no delta received gradient");
+        Ok(())
+    }
+
+    /// Rollback must restore the pre-cycle function exactly.
+    #[test]
+    fn rollback_restores_exactly() -> CResult<()> {
+        let dev = Device::Cpu;
+        let mut model = CapNativeBuilder::default()
+            .with_config(tiny_config())
+            .with_device(dev.clone())
+            .build()?;
+        let batch = Tensor::from_vec((0..24u32).map(|i| i % 48).collect::<Vec<_>>(), (2, 12), &dev)?
+            .to_dtype(DType::U32)?;
+        let before = model.forward(&batch)?.copy()?;
+
+        model.begin_cycle()?;
+        // Simulate learning by writing non-zero deltas everywhere.
+        for block in &model.blocks {
+            let d = block.attn.w_qkv.as_tensor();
+            let noise = Tensor::randn(0f32, 0.1f32, d.dims(), &dev)?;
+            block.attn.w_qkv.set(&noise)?;
+        }
+        let disturbed = model.forward(&batch)?;
+        let moved = (&before - &disturbed)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(moved > 0.0, "deltas had no effect; test is vacuous");
+
+        let n = model.config.downstream_n_caps();
+        for k in 0..n {
+            model.rollback_cap(k)?;
+        }
+        let restored = model.forward(&batch)?;
+        let diff = (before - restored)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert_eq!(diff, 0.0, "rollback did not restore exactly: {diff}");
+        Ok(())
     }
 }

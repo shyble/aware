@@ -21,6 +21,11 @@ pub struct CapMoeMlp {
     pub w_gate: Var,
     pub w_value: Var,
     pub w_out: Var,
+    /// Committed bases; present only during a continual-learning cycle,
+    /// when the Vars above hold provisional deltas.
+    pub gate_base: Option<Tensor>,
+    pub value_base: Option<Tensor>,
+    pub out_base: Option<Tensor>,
     pub w_gate_name: String,
     pub w_value_name: String,
     pub w_out_name: String,
@@ -33,6 +38,39 @@ pub struct CapMoeMlp {
 }
 
 impl CapMoeMlp {
+    /// Effective SwiGLU weights: base + delta while a cycle is running.
+    pub fn gate_effective(&self) -> CResult<Tensor> {
+        super::slab::effective(&self.gate_base, &self.w_gate)
+    }
+    pub fn value_effective(&self) -> CResult<Tensor> {
+        super::slab::effective(&self.value_base, &self.w_value)
+    }
+    pub fn out_effective(&self) -> CResult<Tensor> {
+        super::slab::effective(&self.out_base, &self.w_out)
+    }
+
+    /// Begin a continual-learning cycle.
+    pub fn begin_cycle(&mut self) -> CResult<()> {
+        if self.gate_base.is_none() {
+            self.gate_base = Some(super::slab::split(&self.w_gate)?);
+            self.value_base = Some(super::slab::split(&self.w_value)?);
+            self.out_base = Some(super::slab::split(&self.w_out)?);
+        }
+        Ok(())
+    }
+
+    pub fn commit_cap(&mut self, k: usize) -> CResult<()> {
+        super::slab::commit_cap(&mut self.gate_base, &self.w_gate, k)?;
+        super::slab::commit_cap(&mut self.value_base, &self.w_value, k)?;
+        super::slab::commit_cap(&mut self.out_base, &self.w_out, k)
+    }
+
+    pub fn rollback_cap(&mut self, k: usize) -> CResult<()> {
+        super::slab::rollback_cap(&self.w_gate, k)?;
+        super::slab::rollback_cap(&self.w_value, k)?;
+        super::slab::rollback_cap(&self.w_out, k)
+    }
+
     pub fn new(
         n_caps: usize,
         d_model: usize,
@@ -70,6 +108,9 @@ impl CapMoeMlp {
             w_gate,
             w_value,
             w_out,
+            gate_base: None,
+            value_base: None,
+            out_base: None,
             w_gate_name,
             w_value_name,
             w_out_name,
@@ -122,9 +163,9 @@ impl CapMoeMlp {
 
         let mut accum: Option<Tensor> = None;
         for k in 0..self.n_caps {
-            let w_g_k = self.w_gate.as_tensor().narrow(0, k, 1)?.squeeze(0)?;
-            let w_v_k = self.w_value.as_tensor().narrow(0, k, 1)?.squeeze(0)?;
-            let w_o_k = self.w_out.as_tensor().narrow(0, k, 1)?.squeeze(0)?;
+            let w_g_k = &self.gate_effective()?.narrow(0, k, 1)?.squeeze(0)?;
+            let w_v_k = &self.value_effective()?.narrow(0, k, 1)?.squeeze(0)?;
+            let w_o_k = &self.out_effective()?.narrow(0, k, 1)?.squeeze(0)?;
 
             let gate = h_flat.matmul(&w_g_k)?;
             let gate_act = silu(&gate)?;
@@ -176,12 +217,12 @@ impl CapMoeMlp {
             super::blocksparse::try_blocksparse_routing(cap_acts, self.n_caps, &self.device)?,
         ) {
             let gate = super::blocksparse::apply_blocksparse_projection(
-                &h_flat, self.w_gate.as_tensor(), &bs)?;
+                &h_flat, &self.gate_effective()?, &bs)?;
             let value = super::blocksparse::apply_blocksparse_projection(
-                &h_flat, self.w_value.as_tensor(), &bs)?;
+                &h_flat, &self.value_effective()?, &bs)?;
             let hidden = silu(&gate)?.mul(&value)?;
             let out_flat = super::blocksparse::apply_blocksparse_projection(
-                &hidden, self.w_out.as_tensor(), &bs)?;
+                &hidden, &self.out_effective()?, &bs)?;
             let mut out_dims: Vec<usize> = h_dims[..n_dim - 1].to_vec();
             out_dims.push(self.d_model);
             return out_flat.reshape(out_dims);
@@ -194,12 +235,12 @@ impl CapMoeMlp {
 
         let h_sorted = h_flat.index_select(&routing.perm_t, 0)?;
         let gate_sorted =
-            apply_bounded_grouped_projection(&h_sorted, self.w_gate.as_tensor(), &routing)?;
+            apply_bounded_grouped_projection(&h_sorted, &self.gate_effective()?, &routing)?;
         let value_sorted =
-            apply_bounded_grouped_projection(&h_sorted, self.w_value.as_tensor(), &routing)?;
+            apply_bounded_grouped_projection(&h_sorted, &self.value_effective()?, &routing)?;
         let hidden_sorted = silu(&gate_sorted)?.mul(&value_sorted)?;
         let out_sorted =
-            apply_bounded_grouped_projection(&hidden_sorted, self.w_out.as_tensor(), &routing)?;
+            apply_bounded_grouped_projection(&hidden_sorted, &self.out_effective()?, &routing)?;
         let out_flat = out_sorted.index_select(&routing.inv_perm_t, 0)?;
 
         let mut out_dims: Vec<usize> = h_dims[..n_dim - 1].to_vec();
@@ -220,9 +261,9 @@ impl CapMoeMlp {
         }
         let idx_u32: Vec<u32> = keep_indices.iter().map(|&i| i as u32).collect();
         let idx_t = Tensor::from_vec(idx_u32, (kept,), &self.device)?;
-        let new_g = self.w_gate.as_tensor().index_select(&idx_t, 0)?;
-        let new_v = self.w_value.as_tensor().index_select(&idx_t, 0)?;
-        let new_o = self.w_out.as_tensor().index_select(&idx_t, 0)?;
+        let new_g = &self.gate_effective()?.index_select(&idx_t, 0)?;
+        let new_v = &self.value_effective()?.index_select(&idx_t, 0)?;
+        let new_o = &self.out_effective()?.index_select(&idx_t, 0)?;
         let new_var_g = Var::from_tensor(&new_g)?;
         let new_var_v = Var::from_tensor(&new_v)?;
         let new_var_o = Var::from_tensor(&new_o)?;
@@ -266,9 +307,9 @@ impl CapMoeMlp {
             &self.device,
             self.dtype,
         )?;
-        let cat_g = Tensor::cat(&[self.w_gate.as_tensor(), &new_g], 0)?;
-        let cat_v = Tensor::cat(&[self.w_value.as_tensor(), &new_v], 0)?;
-        let cat_o = Tensor::cat(&[self.w_out.as_tensor(), &new_o], 0)?;
+        let cat_g = Tensor::cat(&[&self.gate_effective()?, &new_g], 0)?;
+        let cat_v = Tensor::cat(&[&self.value_effective()?, &new_v], 0)?;
+        let cat_o = Tensor::cat(&[&self.out_effective()?, &new_o], 0)?;
         let new_var_g = Var::from_tensor(&cat_g)?;
         let new_var_v = Var::from_tensor(&cat_v)?;
         let new_var_o = Var::from_tensor(&cat_o)?;
@@ -312,9 +353,9 @@ impl CapMoeMlp {
             &self.device,
             self.dtype,
         )?;
-        let new_w_gate = splice_row(self.w_gate.as_tensor(), k, &new_g, self.n_caps)?;
-        let new_w_value = splice_row(self.w_value.as_tensor(), k, &new_v, self.n_caps)?;
-        let new_w_out = splice_row(self.w_out.as_tensor(), k, &new_o, self.n_caps)?;
+        let new_w_gate = splice_row(&self.gate_effective()?, k, &new_g, self.n_caps)?;
+        let new_w_value = splice_row(&self.value_effective()?, k, &new_v, self.n_caps)?;
+        let new_w_out = splice_row(&self.out_effective()?, k, &new_o, self.n_caps)?;
         let new_var_g = Var::from_tensor(&new_w_gate)?;
         let new_var_v = Var::from_tensor(&new_w_value)?;
         let new_var_o = Var::from_tensor(&new_w_out)?;

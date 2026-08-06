@@ -14,6 +14,8 @@ pub struct CapKeyedRmsNorm {
     pub eps: f64,
     /// (n_caps, d_model). Each row initialized to ones.
     pub weight: Var,
+    /// Committed base; present only during a continual-learning cycle.
+    pub weight_base: Option<Tensor>,
     pub weight_name: String,
     pub varmap: Arc<Mutex<VarMap>>,
     pub device: Device,
@@ -21,6 +23,26 @@ pub struct CapKeyedRmsNorm {
 }
 
 impl CapKeyedRmsNorm {
+    /// Effective norm scale: base + delta while a cycle is running.
+    pub fn weight_effective(&self) -> CResult<Tensor> {
+        super::slab::effective(&self.weight_base, &self.weight)
+    }
+
+    pub fn begin_cycle(&mut self) -> CResult<()> {
+        if self.weight_base.is_none() {
+            self.weight_base = Some(super::slab::split(&self.weight)?);
+        }
+        Ok(())
+    }
+
+    pub fn commit_cap(&mut self, k: usize) -> CResult<()> {
+        super::slab::commit_cap(&mut self.weight_base, &self.weight, k)
+    }
+
+    pub fn rollback_cap(&mut self, k: usize) -> CResult<()> {
+        super::slab::rollback_cap(&self.weight, k)
+    }
+
     pub fn new(
         n_caps: usize,
         d_model: usize,
@@ -46,6 +68,7 @@ impl CapKeyedRmsNorm {
             top_k,
             eps,
             weight,
+            weight_base: None,
             weight_name,
             varmap,
             device,
@@ -78,7 +101,7 @@ impl CapKeyedRmsNorm {
 
         // Per-token mixed weight via top-K (or full) softmax over caps.
         let gate_w = top_k_softmax(&cap_flat, self.top_k)?;
-        let mixed_weight = gate_w.matmul(self.weight.as_tensor())?;
+        let mixed_weight = gate_w.matmul(&self.weight_effective()?)?;
 
         let out_flat = normalized.mul(&mixed_weight)?;
         let mut out_dims: Vec<usize> = xs_dims[..n_dim - 1].to_vec();
