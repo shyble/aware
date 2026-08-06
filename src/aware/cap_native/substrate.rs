@@ -34,6 +34,27 @@ impl CapNativeSubstrate {
         CapNativeBuilder::default()
     }
 
+    /// Winning cap per token at each discovered layer, for identity
+    /// instrumentation. Returns `(l0_winners, l1_winners)` as `(B, S)`
+    /// u32 tensors; `l1_winners` is `None` for single-discovery models.
+    ///
+    /// Everything stays on the device — callers accumulate these across
+    /// batches and transfer once per pass, never per batch.
+    pub fn cap_winners(&self, token_ids: &Tensor) -> CResult<(Tensor, Option<Tensor>)> {
+        let emb = self.embeddings.forward(token_ids)?;
+        let l0_acts = self.cap_layer.cap_activations(&emb)?; // (B, S, n_caps_0)
+        let l0 = l0_acts.argmax(candle_core::D::Minus1)?; // (B, S) u32
+        let l1 = match &self.cap_layer_1 {
+            Some(layer1) => {
+                let h0 = self.cap_layer.forward(&emb)?;
+                let l1_acts = layer1.cap_activations(&h0)?;
+                Some(l1_acts.argmax(candle_core::D::Minus1)?)
+            }
+            None => None,
+        };
+        Ok((l0, l1))
+    }
+
     /// Forward: token_ids (B, S) -> logits (B, S, vocab).
     pub fn forward(&self, token_ids: &Tensor) -> CResult<Tensor> {
         let emb = self.embeddings.forward(token_ids)?;

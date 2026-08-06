@@ -34,7 +34,7 @@ use aware::aware::train::LossKind;
 use aware::aware::train::StreamingFeeder;
 use aware::aware::OptimizerKind;
 use aware::data::bpe::{ensure_tokenized, load_bpe, BPETokenizer};
-use candle_core::{Device, Result};
+use candle_core::{Device, Result, Tensor};
 use candle_nn::Optimizer;
 
 /// Sample a bootstrap set from a tokenized .bin file without loading the
@@ -157,8 +157,22 @@ fn main() -> Result<()> {
     let lr = env_f64("AWARE_BENCH_LR", 3e-4);
 
     // Cap layer config (mirrors the cap-augmented transformer).
+    // Continual-learning plumbing. LOAD builds the model without
+    // discovery (the loaded checkpoint supplies keys, ids and weights);
+    // SAVE writes a full checkpoint at the end of the run.
+    let load_weights = env::var("AWARE_BENCH_LOAD_WEIGHTS").ok();
+    let save_weights = env::var("AWARE_BENCH_SAVE_WEIGHTS").ok();
+
     let discovery_str = env_str("AWARE_BENCH_CAP_DISCOVERY", "kmeans");
-    let discovery = parse_discovery(&discovery_str);
+    let discovery = if load_weights.is_some() {
+        // Whatever the preset says, discovery is pointless before a
+        // load: the checkpoint overwrites keys, and running KMeans
+        // first would waste time and imply an identity that is about
+        // to be replaced.
+        DiscoveryKind::NoDiscovery
+    } else {
+        parse_discovery(&discovery_str)
+    };
     let n_caps_target = env_usize("AWARE_BENCH_CAP_N_TARGET", 330);
     let cap_window = env_usize("AWARE_BENCH_CAP_WINDOW", 4);
 
@@ -174,7 +188,11 @@ fn main() -> Result<()> {
     let l1_budget = env_usize("AWARE_CN_L1_BUDGET", l1_n_caps.max(1) * 2);
     let l1_window = env_usize("AWARE_CN_L1_WINDOW", 1);
     let l1_discovery_str = env_str("AWARE_CN_L1_DISCOVERY", "kmeans");
-    let l1_discovery = parse_discovery(&l1_discovery_str);
+    let l1_discovery = if load_weights.is_some() {
+        DiscoveryKind::NoDiscovery
+    } else {
+        parse_discovery(&l1_discovery_str)
+    };
     let l1_gradient_train = env_bool("AWARE_CN_L1_GRADIENT_TRAIN", false);
 
     let run_dir = format!("{}/{}", output_dir, run_id);
@@ -271,16 +289,15 @@ fn main() -> Result<()> {
 
     // Bootstrap sample for KMeans cap discovery — sampled directly from
     // train.bin without holding the corpus in memory.
-    let bootstrap_tokens = sample_bootstrap_from_file(
-        &train_bin,
-        2000,
-        cap_window.max(1),
-        seed,
-    )
-    .unwrap_or_else(|e| {
-        eprintln!("ERROR: bootstrap sample: {}", e);
-        std::process::exit(1)
-    });
+    let bootstrap_tokens = if load_weights.is_some() {
+        Vec::new() // keys come from the checkpoint, not from discovery
+    } else {
+        sample_bootstrap_from_file(&train_bin, 2000, cap_window.max(1), seed)
+            .unwrap_or_else(|e| {
+                eprintln!("ERROR: bootstrap sample: {}", e);
+                std::process::exit(1)
+            })
+    };
 
     // ── Build cap-native substrate ──
     let device = aware::aware::default_device()?;
@@ -321,12 +338,17 @@ fn main() -> Result<()> {
         );
     }
 
-    let model = CapNativeSubstrate::builder()
+    let mut model = CapNativeSubstrate::builder()
         .with_config(config.clone())
         .with_device(device.clone())
         .with_seed(seed)
         .with_bootstrap_sample_tokens(bootstrap_tokens)
         .build()?;
+    if let Some(ckpt) = &load_weights {
+        aware::aware::cap_native::load_checkpoint(&mut model, ckpt)?;
+        println!("[cn-bench] loaded checkpoint: {}", ckpt);
+    }
+    let model = model; // immutable from here
     let n_params = model.n_params();
     println!(
         "[cn-bench] params: {} ({:.2} MB)",
@@ -421,6 +443,76 @@ fn main() -> Result<()> {
         Ok(())
     };
 
+    // ── Eval-only mode (continual-learning instrumentation) ──
+    // Loads happen above; here we run a deterministic pass over val,
+    // optionally dumping per-token winning caps, and exit without
+    // touching the training path. Determinism: the val feeder is seeded
+    // from AWARE_BENCH_SEED, so two eval-only runs with the same seed
+    // score the SAME token stream — required for winner-dump comparison.
+    if env_bool("AWARE_BENCH_EVAL_ONLY", false) {
+        let n_batches = env_usize("AWARE_BENCH_EVAL_BATCHES", 64);
+        let dump_path = env::var("AWARE_CN_DUMP_WINNERS").ok();
+        let mut total_loss = 0.0f32;
+        let mut l0_parts: Vec<Tensor> = Vec::new();
+        let mut l1_parts: Vec<Tensor> = Vec::new();
+
+        for _ in 0..n_batches {
+            let (inp, tgt) = val_feeder.next_batch(&device)?;
+            let logits = model.forward(&inp)?;
+            let (b, t, v) = logits.dims3()?;
+            let loss = candle_nn::loss::cross_entropy(
+                &logits.reshape((b * t, v))?,
+                &tgt.reshape((b * t,))?,
+            )?;
+            total_loss += loss.to_scalar::<f32>()?;
+
+            if dump_path.is_some() {
+                // Winners stay on the device; one transfer per pass at
+                // the end, never per batch.
+                let (l0, l1) = model.cap_winners(&inp)?;
+                l0_parts.push(l0.flatten_all()?);
+                if let Some(l1) = l1 {
+                    l1_parts.push(l1.flatten_all()?);
+                }
+            }
+        }
+
+        let avg_loss = total_loss / n_batches.max(1) as f32;
+        println!(
+            "[cn-bench] EVAL-ONLY over {} batches: val_loss={:.4} val_ppl={:.2}",
+            n_batches,
+            avg_loss,
+            (avg_loss as f64).exp()
+        );
+
+        if let Some(path) = dump_path {
+            let write_winners = |parts: &[Tensor], suffix: &str| -> Result<()> {
+                if parts.is_empty() {
+                    return Ok(());
+                }
+                let refs: Vec<&Tensor> = parts.iter().collect();
+                let all = Tensor::cat(&refs, 0)?;
+                let host: Vec<u32> = all.to_vec1()?; // the single transfer
+                let mut buf = Vec::with_capacity(host.len() * 4);
+                for w in &host {
+                    buf.extend_from_slice(&w.to_le_bytes());
+                }
+                let out = format!("{}.{}.bin", path, suffix);
+                fs::write(&out, buf)
+                    .map_err(|e| candle_core::Error::Msg(format!("write winners: {}", e)))?;
+                println!("[cn-bench] winners: {} ({} tokens)", out, host.len());
+                Ok(())
+            };
+            write_winners(&l0_parts, "l0")?;
+            write_winners(&l1_parts, "l1")?;
+        }
+
+        final_val_loss = avg_loss;
+        write_report(&trajectory, 0.0, final_val_loss, avg_loss, 0, start.elapsed().as_secs_f64(), true)?;
+        println!("[cn-bench] report: {}", report_path);
+        return Ok(());
+    }
+
     for step in 1..=steps {
         let step_start = Instant::now();
         if trace_every_step {
@@ -507,5 +599,13 @@ fn main() -> Result<()> {
         true,
     )?;
     println!("[cn-bench] report: {}", report_path);
+
+    if let Some(ckpt) = &save_weights {
+        if let Some(parent) = std::path::Path::new(ckpt).parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        aware::aware::cap_native::save_checkpoint(&model, ckpt)?;
+        println!("[cn-bench] weights: {} (+ .meta)", ckpt);
+    }
     Ok(())
 }
