@@ -1,4 +1,5 @@
 pub mod attention;
+pub mod audit_gate;
 pub mod blocksparse;
 pub mod grouped;
 pub mod block;
@@ -9,6 +10,7 @@ pub mod moe;
 pub mod norm;
 pub mod output;
 pub mod persist;
+pub mod probe;
 pub mod registry;
 pub mod slab;
 pub mod sparse_routing;
@@ -26,5 +28,7 @@ pub use norm::{top_k_softmax, CapKeyedRmsNorm};
 pub use output::CapKeyedOutput;
 pub use persist::{load_checkpoint, save_checkpoint};
 pub use registry::{CapDecision, CapRecord, CommitRegistry};
+pub use probe::{ProbeOutcome, ProbeSet};
+pub use audit_gate::{decide, GateConfig, NoEvidencePolicy};
 
 pub use substrate::{CapNativeBuilder, CapNativeSubstrate};
