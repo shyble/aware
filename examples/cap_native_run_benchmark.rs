@@ -652,9 +652,10 @@ fn main() -> Result<()> {
                 if had > 0 { 100.0 * kept as f64 / had as f64 } else { 0.0 }
             );
             let summary = format!(
-                "{{\n \"arm\": \"bare\",\n \"probes_before\": {},\n \"probes_kept\": {},\n \"retention\": {:.4},\n \"registry\": \"n/a (no cycle)\"\n}}\n",
+                "{{\n \"arm\": \"bare\",\n \"probes_before\": {},\n \"probes_kept\": {},\n \"retention\": {:.4},\n \"b_ppl_post_policy\": {:.4},\n \"registry\": \"n/a (no cycle)\"\n}}\n",
                 had, kept,
-                if had > 0 { kept as f64 / had as f64 } else { 0.0 }
+                if had > 0 { kept as f64 / had as f64 } else { 0.0 },
+                (final_val_loss as f64).exp()
             );
             let _ = fs::write(format!("{}/cl_summary.json", run_dir), summary);
         }
@@ -705,6 +706,35 @@ fn main() -> Result<()> {
             }
         }
 
+        // B quality AFTER the policy. Measuring it before (as the
+        // training report does) makes every arm identical, because they
+        // all train the same way and differ only in what is kept.
+        let b_ppl_post = {
+            let mut feeder = StreamingFeeder::from_file(&val_bin, batch_size, seq_len)
+                .unwrap_or_else(|e| {
+                    eprintln!("ERROR: reopen val feeder: {}", e);
+                    std::process::exit(1)
+                })
+                .with_seed(seed.wrapping_add(1));
+            let n_eval = env_usize("AWARE_BENCH_N_EVAL_BATCHES", 8);
+            let mut total = 0.0f32;
+            for _ in 0..n_eval {
+                let (inp, tgt) = feeder.next_batch(&device)?;
+                let logits = model.forward(&inp)?;
+                let (b, t, v) = logits.dims3()?;
+                total += candle_nn::loss::cross_entropy(
+                    &logits.reshape((b * t, v))?,
+                    &tgt.reshape((b * t,))?,
+                )?
+                .to_scalar::<f32>()?;
+            }
+            ((total / n_eval.max(1) as f32) as f64).exp()
+        };
+        println!(
+            "[cn-bench] B_PPL_POST_POLICY: {:.2}  (arm={})",
+            b_ppl_post, cl_arm
+        );
+
         // Retention after the policy: the number the grid compares.
         if let Some((ps, before)) = probes.as_ref() {
             let final_out = ps.score(&model, &device, batch_size)?;
@@ -723,10 +753,10 @@ fn main() -> Result<()> {
                 cl_arm
             );
             let summary = format!(
-                "{{\n \"arm\": \"{}\",\n \"probes_before\": {},\n \"probes_kept\": {},\n \"retention\": {:.4},\n \"commit_at\": {},\n \"quarantine_at\": {},\n \"registry\": \"{}\"\n}}\n",
+                "{{\n \"arm\": \"{}\",\n \"probes_before\": {},\n \"probes_kept\": {},\n \"retention\": {:.4},\n \"b_ppl_post_policy\": {:.4},\n \"commit_at\": {},\n \"quarantine_at\": {},\n \"registry\": \"{}\"\n}}\n",
                 cl_arm, had, kept,
                 if had > 0 { kept as f64 / had as f64 } else { 0.0 },
-                commit_at, quarantine_at, model.registry.summary()
+                b_ppl_post, commit_at, quarantine_at, model.registry.summary()
             );
             let _ = fs::write(format!("{}/cl_summary.json", run_dir), summary);
         }

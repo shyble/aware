@@ -108,7 +108,7 @@ for arm in bare freeze always_commit gated; do
         AWARE_CL_PROBES="$PROBES" \
         AWARE_CL_COMMIT_AT="$COMMIT_AT" \
         AWARE_CL_QUARANTINE_AT="$QUARANTINE_AT" \
-        "$CN" 2>&1 | grep -E 'probes:|RETENTION|arm=|final val_ppl|ERROR' || true
+        "$CN" 2>&1 | grep -E 'probes:|RETENTION|B_PPL_POST_POLICY|arm=|final val_ppl|ERROR' || true
 
     # `bare` has no probe machinery, so score its retention separately
     # against the same probe set for an apples-to-apples number.
@@ -124,18 +124,20 @@ OUT="$OUT" python3 - <<'PYEOF'
 import json, os, glob
 
 out = os.environ["OUT"]
-print(f"  {'arm':<15}{'retention':>11}   {'B val ppl':>10}   decisions")
+print(f"  {'arm':<15}{'retention':>11}   {'B ppl post':>10}   decisions")
 for arm in ("bare", "freeze", "always_commit", "gated"):
     sfile = glob.glob(f"{out}/{arm}/*/cl_summary.json")
     rep = glob.glob(f"{out}/{arm}/*/report.json")
-    ret, reg = "—", ""
+    ret, ppl, reg = "—", "—", ""
     if sfile:
         s = json.load(open(sfile[0]))
         ret = f"{100*s['retention']:.1f}%"
+        # Post-policy: the pre-policy number in report.json is identical
+        # across arms, because they all train the same way and differ
+        # only in what is kept afterwards.
+        if "b_ppl_post_policy" in s:
+            ppl = f"{s['b_ppl_post_policy']:.2f}"
         reg = s.get("registry", "")
-    ppl = "—"
-    if rep:
-        ppl = f"{json.load(open(rep[0]))['final_val_perplexity']:.2f}"
     print(f"  {arm:<15}{ret:>11}   {ppl:>10}   {reg}")
 
 print()
@@ -143,5 +145,7 @@ print("  Reading it:")
 print("   - always_commit ≈ bare  → the split is inert; the GATE is what acts")
 print("   - freeze = 100% retention, poor B ppl → the L1 floor, as designed")
 print("   - gated: high retention AND B ppl near bare → the L2 claim")
+print("   - freeze B ppl should be WORSE than bare; if not, the deltas")
+print("     were not carrying B's learning and the split is suspect")
 print("   - gated with 0 committed → protection bought by refusing to learn")
 PYEOF

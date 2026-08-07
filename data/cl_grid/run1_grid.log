@@ -1,0 +1,41 @@
+════════ cycle A: train on TinyStories, 3000 steps ════════
+[cn-bench] done. final val_ppl = 8.85, best val_ppl = 8.85 @ step 3000, time = 4391.7s
+[cn-bench] report: data/cl_grid/cycleA/cap_native_unnamed/report.json
+[cn-bench] weights: data/cl_grid/weights_A.safetensors (+ .meta)
+
+════════ cycle B — arm: bare ════════
+[cn-bench] probes: 2000 items, 938 correct before the cycle
+[cn-bench] done. final val_ppl = 11.76, best val_ppl = 11.20 @ step 2800, time = 4593.6s
+[cn-bench] RETENTION: 358/938 = 38.2%  (arm=bare)
+  (bare retention is measured by the eval-only pass below)
+
+════════ cycle B — arm: freeze ════════
+[cn-bench] probes: 2000 items, 938 correct before the cycle
+[cn-bench] done. final val_ppl = 11.78, best val_ppl = 11.22 @ step 2800, time = 4580.3s
+[cn-bench] arm=freeze: all 64 deltas discarded
+[cn-bench] RETENTION: 701/938 = 74.7%  (arm=freeze)
+
+════════ cycle B — arm: always_commit ════════
+[cn-bench] probes: 2000 items, 938 correct before the cycle
+[cn-bench] done. final val_ppl = 11.78, best val_ppl = 11.22 @ step 2800, time = 4559.0s
+[cn-bench] arm=always_commit: all 64 deltas merged
+[cn-bench] RETENTION: 363/938 = 38.7%  (arm=always_commit)
+
+════════ cycle B — arm: gated ════════
+[cn-bench] probes: 2000 items, 938 correct before the cycle
+[cn-bench] done. final val_ppl = 11.78, best val_ppl = 11.22 @ step 2800, time = 4513.9s
+[cn-bench] arm=gated: cycle 1: 2 committed, 61 rolled back, 1 quarantined, 0 untouched (of 64)
+[cn-bench] RETENTION: 700/938 = 74.6%  (arm=gated)
+
+════════════════════════ GRID SUMMARY ════════════════════════
+  arm              retention    B val ppl   decisions
+  bare                 38.2%        11.76   n/a (no cycle)
+  freeze               74.7%        11.78   cycle 1: 0 committed, 64 rolled back, 0 quarantined, 0 untouched (of 64)
+  always_commit        38.7%        11.78   cycle 1: 64 committed, 0 rolled back, 0 quarantined, 0 untouched (of 64)
+  gated                74.6%        11.78   cycle 1: 2 committed, 61 rolled back, 1 quarantined, 0 untouched (of 64)
+
+  Reading it:
+   - always_commit ≈ bare  → the split is inert; the GATE is what acts
+   - freeze = 100% retention, poor B ppl → the L1 floor, as designed
+   - gated: high retention AND B ppl near bare → the L2 claim
+   - gated with 0 committed → protection bought by refusing to learn
