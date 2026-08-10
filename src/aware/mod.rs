@@ -22,4 +22,4 @@ pub use config::{AuditConfig, BlockConfig, CapConfig, Config};
 pub use device::{default_device, device_label};
 pub use discover::{AuditReport, Discovery, DiscoveryKind};
 pub use substrate::{BlockBuilder, CapStats, LayerCapStats, Substrate, SubstrateBuilder};
-pub use train::{LossKind, OptimizerKind, StreamingFeeder, Trainer};
+pub use train::{CarryMode, LossKind, OptimizerKind, PersistentAdamW, StreamingFeeder, Trainer};
