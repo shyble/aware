@@ -26,7 +26,22 @@ pub struct CapPairAttention {
     /// Learnable affinity. `[n_heads, n_caps, n_caps]` — one affinity
     /// pattern per head, so heads can specialise on different cap-cap
     /// relations. At n_heads=1 this is the original `[n_caps, n_caps]`.
-    pub a_pair: Tensor,
+    ///
+    /// `None` when the affinity is factored (see `a_lr`).
+    pub a_pair: Option<Tensor>,
+    /// Low-rank factorisation `A = U Vᵀ`, shapes `[h, n_caps, r]`.
+    ///
+    /// Full-rank A costs n_caps² per head in BOTH parameters and compute
+    /// — 330² × 4 heads ≈ 436K multiplies per token, over four times an
+    /// entire standard attention block. Factoring drops both to
+    /// 2·n_caps·r.
+    ///
+    /// It also reveals what cap-pair is: `(cap·U)·(cap·V)ᵀ` is exactly
+    /// query-key attention with the queries and keys computed from cap
+    /// activations instead of from x. Standard attention is this with an
+    /// identity feature map and r = d_head; full-rank cap-pair is the
+    /// opposite corner. Rank is the axis between them.
+    pub a_lr: Option<(Tensor, Tensor)>,
     pub w_v: Linear,
     pub w_o: Linear,
     pub n_heads: usize,
@@ -85,15 +100,23 @@ impl CapPairAttention {
             }
         };
 
-        // A_pair: one [n_caps, n_caps] affinity per head, small random init.
-        let a_pair = vb.get_with_hints(
-            (n_heads, n_caps, n_caps),
-            "a_pair",
-            candle_nn::Init::Randn {
-                mean: 0.0,
-                stdev: 0.02,
-            },
-        )?;
+        // Rank 0 (the default) keeps the original full-rank affinity, so
+        // existing runs are bit-identical; any positive rank factors it.
+        let rank: usize = std::env::var("AWARE_CAP_PAIR_RANK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let init = candle_nn::Init::Randn { mean: 0.0, stdev: 0.02 };
+        let (a_pair, a_lr) = if rank == 0 || rank >= n_caps {
+            (
+                Some(vb.get_with_hints((n_heads, n_caps, n_caps), "a_pair", init)?),
+                None,
+            )
+        } else {
+            let u = vb.get_with_hints((n_heads, n_caps, rank), "a_u", init)?;
+            let v = vb.get_with_hints((n_heads, n_caps, rank), "a_v", init)?;
+            (None, Some((u, v)))
+        };
 
         let w_v = candle_nn::linear_no_bias(d_model, d_model, vb.pp("w_v"))?;
         let w_o = candle_nn::linear_no_bias(d_model, d_model, vb.pp("w_o"))?;
@@ -101,6 +124,7 @@ impl CapPairAttention {
         Ok(Self {
             keys_src,
             a_pair,
+            a_lr,
             w_v,
             w_o,
             n_heads,
@@ -134,12 +158,28 @@ impl Attention for CapPairAttention {
         //    c_a[h] = cap_acts @ A_pair[h]                -> [B, h, T, n_caps]
         //    scores[h][i, j] = c_a[h][i] · cap_acts[j]    -> [B, h, T, T]
         let cap_acts_b = cap_acts.unsqueeze(1)?; // [B, 1, T, n_caps]
-        let a_pair_b = self.a_pair.unsqueeze(0)?; // [1, h, n_caps, n_caps]
-        let c_a = cap_acts_b.broadcast_matmul(&a_pair_b)?; // [B, h, T, n_caps]
-        let cap_acts_t = cap_acts_b
-            .transpose(D::Minus2, D::Minus1)?
-            .contiguous()?; // [B, 1, n_caps, T]
-        let scores = c_a.broadcast_matmul(&cap_acts_t)?; // [B, h, T, T]
+        let scores = match (&self.a_pair, &self.a_lr) {
+            (Some(a), _) => {
+                let a_pair_b = a.unsqueeze(0)?; // [1, h, n_caps, n_caps]
+                let c_a = cap_acts_b.broadcast_matmul(&a_pair_b)?; // [B, h, T, n_caps]
+                let cap_acts_t = cap_acts_b
+                    .transpose(D::Minus2, D::Minus1)?
+                    .contiguous()?; // [B, 1, n_caps, T]
+                c_a.broadcast_matmul(&cap_acts_t)? // [B, h, T, T]
+            }
+            // Factored: never materialise A. Project to q and k in rank
+            // space first, so the cost is 2·n_caps·r rather than n_caps².
+            (None, Some((u, v))) => {
+                let q = cap_acts_b.broadcast_matmul(&u.unsqueeze(0)?)?; // [B, h, T, r]
+                let k = cap_acts_b.broadcast_matmul(&v.unsqueeze(0)?)?; // [B, h, T, r]
+                q.matmul(&k.transpose(D::Minus2, D::Minus1)?.contiguous()?)?
+            }
+            (None, None) => {
+                return Err(candle_core::Error::Msg(
+                    "CapPairAttention: neither a_pair nor a_lr present".into(),
+                ))
+            }
+        };
         let scores = (scores * self.scale)?;
 
         // Causal mask + softmax
