@@ -405,6 +405,7 @@ fn main() -> Result<()> {
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
+        let mode = env_str("AWARE_BENCH_PROBE_MODE", "shuffle");
         let n_seq = env_usize("AWARE_BENCH_PROBE_SEQS", 512);
         let need = seq_len + 1;
         let usable = toks.len().saturating_sub(need);
@@ -461,6 +462,9 @@ fn main() -> Result<()> {
             (base as f64).exp(),
             n_seq
         );
+        println!("[probe] mode = {} ({})", mode,
+            if mode == "replace" { "destroys CONTENT: is the band used at all?" }
+            else { "destroys ORDER only: is the arrangement used?" });
         println!("[probe] {:>12} {:>10} {:>10}", "band", "d loss", "d ppl%");
 
         // Bands are distances BACK from the predicted position.
@@ -483,11 +487,30 @@ fn main() -> Result<()> {
             for row in perturbed.iter_mut() {
                 let a = seq_len - hi;
                 let b = seq_len - lo;
-                // Fisher-Yates inside the band only; everything outside
-                // is untouched, so the comparison isolates that region.
-                for i in (a + 1..=b).rev() {
-                    let j = a + (next() as usize) % (i - a + 1);
-                    row.swap(i, j);
+                match mode.as_str() {
+                    // REPLACE destroys the band's CONTENT, drawing from
+                    // the corpus so the marginal token distribution is
+                    // unchanged. This is the test that says whether the
+                    // band is used at all.
+                    //
+                    // Shuffling alone cannot: attention retrieves by
+                    // content, and does not need to know where a token is
+                    // to use it. A model can depend heavily on a distant
+                    // region while being wholly indifferent to its
+                    // arrangement, and shuffling scores that as zero.
+                    "replace" => {
+                        for i in a..=b {
+                            row[i] = toks[(next() as usize) % toks.len()];
+                        }
+                    }
+                    // SHUFFLE preserves content and destroys only order,
+                    // so it isolates order sensitivity.
+                    _ => {
+                        for i in (a + 1..=b).rev() {
+                            let j = a + (next() as usize) % (i - a + 1);
+                            row.swap(i, j);
+                        }
+                    }
                 }
             }
             let l = score(&perturbed)?;
