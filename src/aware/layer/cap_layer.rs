@@ -62,7 +62,7 @@ impl CapLayer {
         // discovered over representations that do not exist until the
         // model is trained, so freezing them pins the layer to a guess;
         // the delta lets it follow what the layer below becomes.
-        let key_delta = if config.gradient_train {
+        let key_delta = if config.adapt_keys {
             Some(vb.get_with_hints(
                 caps.keys.shape(),
                 "key_delta",

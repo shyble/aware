@@ -78,7 +78,7 @@ fn sample_bootstrap_from_file(
     }
     Ok(out)
 }
-use candle_core::{Device, Result};
+use candle_core::{Device, Result, Tensor};
 use candle_nn::Optimizer;
 
 /// Which backend this binary was compiled with. Recorded in every report so
@@ -380,6 +380,128 @@ fn main() -> Result<()> {
     builder = builder.with_block_repeated(n_blocks, block);
     let model = builder.build()?;
     let n_params = model.n_params();
+
+    // ── Compositional probe: does the model USE word order, and where? ──
+    //
+    // Perplexity says how well a model predicts, not whether it does so
+    // by composing structure or by counting co-occurrences. A bag-of-words
+    // predictor and a syntactic one can reach similar loss on a corpus
+    // this size.
+    //
+    // The discriminator is order sensitivity. Composition requires order;
+    // co-occurrence statistics do not. So: score the last token of each
+    // held-out sequence, then re-score it with the context PERMUTED inside
+    // a band at a given distance, and measure how much worse it gets.
+    // Large degradation means the model was relying on the arrangement of
+    // that region, not merely its contents.
+    //
+    // Resolving by distance band separates local syntax from long-range
+    // structure, which is exactly where the PMI measurement predicts caps
+    // and dot-product attention should differ.
+    if env_bool("AWARE_BENCH_PROBE_COMPOSITION", false) {
+        let bytes = fs::read(&val_bin)
+            .map_err(|e| candle_core::Error::Msg(format!("probe read {val_bin:?}: {e}")))?;
+        let toks: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let n_seq = env_usize("AWARE_BENCH_PROBE_SEQS", 512);
+        let need = seq_len + 1;
+        let usable = toks.len().saturating_sub(need);
+        if usable < n_seq {
+            return Err(candle_core::Error::Msg("probe: val corpus too small".into()));
+        }
+        let stride = usable / n_seq;
+
+        // Contexts and their targets, drawn once and reused for every
+        // condition so all conditions score the SAME positions.
+        let mut ctx: Vec<Vec<u32>> = Vec::with_capacity(n_seq);
+        let mut tgt: Vec<u32> = Vec::with_capacity(n_seq);
+        for i in 0..n_seq {
+            let st = i * stride;
+            ctx.push(toks[st..st + seq_len].to_vec());
+            tgt.push(toks[st + seq_len]);
+        }
+
+        // Deterministic permutation so runs are comparable across models.
+        let mut rng: u64 = 0x9E3779B97F4A7C15;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+
+        let score = |rows: &[Vec<u32>]| -> Result<f32> {
+            let mut total = 0.0f32;
+            let bs = batch_size.max(1);
+            for chunk_start in (0..rows.len()).step_by(bs) {
+                let b = bs.min(rows.len() - chunk_start);
+                let flat: Vec<u32> = rows[chunk_start..chunk_start + b]
+                    .iter()
+                    .flat_map(|r| r.iter().copied())
+                    .collect();
+                let inp = Tensor::from_vec(flat, (b, seq_len), &device)?;
+                let logits = model.forward(&inp)?;
+                let last = logits.narrow(1, seq_len - 1, 1)?.squeeze(1)?;
+                let t = Tensor::from_vec(
+                    tgt[chunk_start..chunk_start + b].to_vec(),
+                    (b,),
+                    &device,
+                )?;
+                total += candle_nn::loss::cross_entropy(&last, &t)?.to_scalar::<f32>()? * b as f32;
+            }
+            Ok(total / rows.len() as f32)
+        };
+
+        let base = score(&ctx)?;
+        println!(
+            "\n[probe] clean loss {:.4} (ppl {:.2}) over {} sequences",
+            base,
+            (base as f64).exp(),
+            n_seq
+        );
+        println!("[probe] {:>12} {:>10} {:>10}", "band", "d loss", "d ppl%");
+
+        // Bands are distances BACK from the predicted position.
+        // Bands are configurable so the probe itself can be validated:
+        // a band covering the whole distant context answers "is anything
+        // past N used at all", which a fixed ladder cannot.
+        let band_spec = env_str("AWARE_BENCH_PROBE_BANDS", "1-4,5-12,13-32,33-64");
+        let bands: Vec<(usize, usize)> = band_spec
+            .split(',')
+            .filter_map(|b| {
+                let (a, c) = b.trim().split_once('-')?;
+                Some((a.trim().parse().ok()?, c.trim().parse().ok()?))
+            })
+            .collect();
+        for (lo, hi) in bands {
+            if hi >= seq_len {
+                continue;
+            }
+            let mut perturbed = ctx.clone();
+            for row in perturbed.iter_mut() {
+                let a = seq_len - hi;
+                let b = seq_len - lo;
+                // Fisher-Yates inside the band only; everything outside
+                // is untouched, so the comparison isolates that region.
+                for i in (a + 1..=b).rev() {
+                    let j = a + (next() as usize) % (i - a + 1);
+                    row.swap(i, j);
+                }
+            }
+            let l = score(&perturbed)?;
+            println!(
+                "[probe] {:>12} {:>10.4} {:>9.1}%",
+                format!("{}-{}", lo, hi),
+                l - base,
+                100.0 * ((l as f64).exp() / (base as f64).exp() - 1.0)
+            );
+        }
+        println!("[probe] larger degradation = more reliance on ARRANGEMENT, not just content\n");
+        return Ok(());
+    }
+
     println!(
         "[bench] params: {} ({:.2} MB)",
         n_params,

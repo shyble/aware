@@ -183,7 +183,7 @@ fn main() -> Result<()> {
             // target. They adapt via a zero-initialised delta on the
             // discovered base, so they begin exactly where discovery put
             // them and follow the layer below as it trains.
-            gradient_train: i > 0 && !frozen_deep,
+            adapt_keys: i > 0 && !frozen_deep,
             ..Default::default()
         };
         let sample = if i == 0 { Some(&sample_emb) } else { None };

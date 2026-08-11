@@ -42,6 +42,15 @@ pub struct CapConfig {
     /// Hard ceiling; audit / growth cannot exceed this.
     pub n_caps_budget: usize,
     pub gradient_train: bool,
+    /// Let discovered keys move during training, via a zero-initialised
+    /// delta on the frozen base.
+    ///
+    /// Deliberately SEPARATE from `gradient_train`, which means something
+    /// else here: "these keys were not discovered from data, so learn
+    /// them". Adapting discovered keys and learning undiscovered ones are
+    /// different intentions, and conflating them silently changes every
+    /// `nodiscovery` and every checkpoint-loading run.
+    pub adapt_keys: bool,
     /// Window size for cap input. 1 = each cap sees one token's embedding.
     /// N > 1 = cap sees concatenated past N embeddings (causal window).
     pub cap_window: usize,
@@ -56,6 +65,7 @@ impl Default for CapConfig {
             n_caps_target: 330,
             n_caps_budget: 512,
             gradient_train: false,
+            adapt_keys: false,
             cap_window: 1,
             audit: AuditConfig::default(),
         }
