@@ -42,6 +42,19 @@ pub struct CapPairAttention {
     /// identity feature map and r = d_head; full-rank cap-pair is the
     /// opposite corner. Rank is the axis between them.
     pub a_lr: Option<(Tensor, Tensor)>,
+    /// Rotary embedding over the RANK dimension, present with `a_lr`.
+    ///
+    /// Cap-pair scores depend only on which caps fired, never on where
+    /// they fired, so its attention is permutation-invariant over the
+    /// context: two arrangements of the same caps score identically. That
+    /// costs nothing while nothing uses distance, and becomes a hard
+    /// ceiling the moment something does.
+    ///
+    /// The block's shared RoPE is sized for d_head and cannot be reused —
+    /// the factored q and k live in rank space. This one is sized for the
+    /// rank, which is why only the factored form can carry position; the
+    /// full-rank path never materialises a q or k to rotate.
+    pub rope_lr: Option<RoPE>,
     pub w_v: Linear,
     pub w_o: Linear,
     pub n_heads: usize,
@@ -117,6 +130,16 @@ impl CapPairAttention {
             let v = vb.get_with_hints((n_heads, n_caps, rank), "a_v", init)?;
             (None, Some((u, v)))
         };
+        // RoPE needs an even width to pair dimensions for rotation.
+        let rope_lr = match (&a_lr, rank % 2 == 0) {
+            (Some(_), true) => Some(RoPE::new(
+                rank,
+                cfg.max_seq_len.max(1),
+                cfg.rope_base,
+                device,
+            )?),
+            _ => None,
+        };
 
         let w_v = candle_nn::linear_no_bias(d_model, d_model, vb.pp("w_v"))?;
         let w_o = candle_nn::linear_no_bias(d_model, d_model, vb.pp("w_o"))?;
@@ -125,6 +148,7 @@ impl CapPairAttention {
             keys_src,
             a_pair,
             a_lr,
+            rope_lr,
             w_v,
             w_o,
             n_heads,
@@ -172,6 +196,14 @@ impl Attention for CapPairAttention {
             (None, Some((u, v))) => {
                 let q = cap_acts_b.broadcast_matmul(&u.unsqueeze(0)?)?; // [B, h, T, r]
                 let k = cap_acts_b.broadcast_matmul(&v.unsqueeze(0)?)?; // [B, h, T, r]
+                // Rotating both by position makes the product a function
+                // of (i - j): the score gains a relative-distance term
+                // while staying cap-derived. This is the continuous form
+                // of the delta index in A[c_i, c_j, delta].
+                let (q, k) = match &self.rope_lr {
+                    Some(r) => (r.apply(&q.contiguous()?, t)?, r.apply(&k.contiguous()?, t)?),
+                    None => (q, k),
+                };
                 q.matmul(&k.transpose(D::Minus2, D::Minus1)?.contiguous()?)?
             }
             (None, None) => {
