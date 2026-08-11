@@ -216,7 +216,16 @@ fn main() -> Result<()> {
 
     let include_cap_layer = env_bool("AWARE_BENCH_INCLUDE_CAP_LAYER", true);
     let discovery_str = env_str("AWARE_BENCH_CAP_DISCOVERY", "nodiscovery");
-    let discovery = parse_discovery(&discovery_str);
+    // Loading a checkpoint skips discovery: the file supplies the keys
+    // and the cap identity, and re-running KMeans would both waste time
+    // and produce different caps than the ones the weights were trained
+    // against.
+    let load_weights = env::var("AWARE_BENCH_LOAD_WEIGHTS").ok();
+    let discovery = if load_weights.is_some() {
+        DiscoveryKind::NoDiscovery
+    } else {
+        parse_discovery(&discovery_str)
+    };
     let n_caps_target = env_usize("AWARE_BENCH_CAP_N_TARGET", 330);
     let cap_window = env_usize("AWARE_BENCH_CAP_WINDOW", 1);
 
@@ -378,7 +387,12 @@ fn main() -> Result<()> {
         .with_ffn(d_ff)
         .build();
     builder = builder.with_block_repeated(n_blocks, block);
-    let model = builder.build()?;
+    let mut model = builder.build()?;
+    if let Some(ckpt) = &load_weights {
+        model.load_checkpoint(ckpt)?;
+        println!("[bench] loaded checkpoint: {}", ckpt);
+    }
+    let model = model;
     let n_params = model.n_params();
 
     // ── Compositional probe: does the model USE word order, and where? ──

@@ -164,12 +164,157 @@ impl Substrate {
         }
     }
 
+    /// Save a COMPLETE checkpoint: every varmap tensor plus the frozen
+    /// cap keys and identity metadata that live outside the varmap.
+    ///
+    /// The varmap alone does not describe this model when a cap layer is
+    /// present: discovered keys are frozen outside it, and a load that
+    /// misses them silently rediscovers different caps — a wrong model
+    /// with no error. Keys ride in the same safetensors file under
+    /// reserved `__aware__.*` names (`VarMap::load` iterates its own
+    /// vars, so it ignores them); ids and metadata go in a bincode
+    /// sidecar at `<path>.meta`.
     pub fn save_checkpoint(&self, path: &str) -> Result<()> {
-        self.varmap.save(path)
+        if self.concept_layer.is_some() {
+            return Err(candle_core::Error::Msg(
+                "save_checkpoint does not yet persist the concept layer;                  refusing to write an incomplete checkpoint"
+                    .into(),
+            ));
+        }
+        let mut tensors: std::collections::HashMap<String, Tensor> =
+            std::collections::HashMap::new();
+        {
+            let data = self.varmap.data().lock().unwrap();
+            for (name, var) in data.iter() {
+                tensors.insert(name.clone(), var.as_tensor().clone());
+            }
+        }
+        if let Some(cl) = &self.cap_layer {
+            tensors.insert("__aware__.cap_layer.keys".into(), cl.caps.keys.clone());
+            if let Some(v) = &cl.caps.values {
+                tensors.insert("__aware__.cap_layer.values".into(), v.clone());
+            }
+        }
+        if let Some(sm) = &self.shared_cap_matrix {
+            tensors.insert("__aware__.shared.keys".into(), sm.keys.clone());
+            if let Some(v) = &sm.values {
+                tensors.insert("__aware__.shared.values".into(), v.clone());
+            }
+        }
+        candle_core::safetensors::save(&tensors, path)?;
+
+        #[derive(serde::Serialize)]
+        struct LayerMeta<'a> {
+            ids: &'a Vec<u64>,
+            metadata: &'a Vec<super::cap::CapMeta>,
+        }
+        #[derive(serde::Serialize)]
+        struct CkptMeta<'a> {
+            version: u32,
+            cap_layer: Option<LayerMeta<'a>>,
+            shared: Option<LayerMeta<'a>>,
+        }
+        let meta = CkptMeta {
+            version: 1,
+            cap_layer: self.cap_layer.as_ref().map(|cl| LayerMeta {
+                ids: &cl.caps.ids,
+                metadata: &cl.caps.metadata,
+            }),
+            shared: self.shared_cap_matrix.as_ref().map(|sm| LayerMeta {
+                ids: &sm.ids,
+                metadata: &sm.metadata,
+            }),
+        };
+        let bytes = bincode::serialize(&meta)
+            .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+        std::fs::write(format!("{path}.meta"), bytes)
+            .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+        Ok(())
     }
 
+    /// Load a checkpoint written by [`Substrate::save_checkpoint`].
+    /// Strict: missing tensors, shape mismatches, or a cap-layer
+    /// mismatch between checkpoint and model are errors, never warnings.
     pub fn load_checkpoint(&mut self, path: &str) -> Result<()> {
-        self.varmap.load(path)
+        self.varmap.load(path)?;
+
+        let all = candle_core::safetensors::load(path, &self.device)?;
+        let msg = |m: String| candle_core::Error::Msg(m);
+
+        match (&mut self.cap_layer, all.contains_key("__aware__.cap_layer.keys")) {
+            (Some(cl), true) => {
+                let keys = all.get("__aware__.cap_layer.keys").unwrap();
+                if keys.dims() != cl.caps.keys.dims() {
+                    return Err(msg(format!(
+                        "checkpoint {path}: cap_layer keys shape {:?} vs model {:?}",
+                        keys.dims(),
+                        cl.caps.keys.dims()
+                    )));
+                }
+                cl.caps.keys = keys.clone();
+                if cl.caps.values.is_some() {
+                    cl.caps.values = Some(
+                        all.get("__aware__.cap_layer.values")
+                            .cloned()
+                            .ok_or_else(|| msg(format!(
+                                "checkpoint {path} is missing cap_layer values"
+                            )))?,
+                    );
+                }
+            }
+            (None, false) => {}
+            (Some(_), false) => {
+                return Err(msg(format!(
+                    "checkpoint {path} has no cap layer but the model does"
+                )))
+            }
+            (None, true) => {
+                return Err(msg(format!(
+                    "checkpoint {path} contains a cap layer but the model has none"
+                )))
+            }
+        }
+        if let Some(sm) = &mut self.shared_cap_matrix {
+            let keys = all
+                .get("__aware__.shared.keys")
+                .cloned()
+                .ok_or_else(|| msg(format!("checkpoint {path} is missing shared cap keys")))?;
+            sm.keys = keys;
+        }
+
+        #[derive(serde::Deserialize)]
+        struct LayerMetaOwned {
+            ids: Vec<u64>,
+            metadata: Vec<super::cap::CapMeta>,
+        }
+        #[derive(serde::Deserialize)]
+        struct CkptMetaOwned {
+            #[allow(dead_code)]
+            version: u32,
+            cap_layer: Option<LayerMetaOwned>,
+            shared: Option<LayerMetaOwned>,
+        }
+        let meta_path = format!("{path}.meta");
+        let bytes = std::fs::read(&meta_path)
+            .map_err(|e| msg(format!("checkpoint sidecar {meta_path}: {e}")))?;
+        let meta: CkptMetaOwned =
+            bincode::deserialize(&bytes).map_err(|e| msg(e.to_string()))?;
+        if let (Some(cl), Some(lm)) = (&mut self.cap_layer, meta.cap_layer) {
+            if lm.ids.len() != cl.caps.n_caps() {
+                return Err(msg(format!(
+                    "checkpoint sidecar {meta_path}: {} ids vs {} caps",
+                    lm.ids.len(),
+                    cl.caps.n_caps()
+                )));
+            }
+            cl.caps.ids = lm.ids;
+            cl.caps.metadata = lm.metadata;
+        }
+        if let (Some(sm), Some(lm)) = (&mut self.shared_cap_matrix, meta.shared) {
+            sm.ids = lm.ids;
+            sm.metadata = lm.metadata;
+        }
+        Ok(())
     }
 
     pub fn builder() -> SubstrateBuilder {
